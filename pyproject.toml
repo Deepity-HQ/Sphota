@@ -1,13 +1,17 @@
 [project]
 name = "sphota"
 version = "0.1.0"
-description = "Add your description here"
+description = "A language model build with PCNs, made with associative memory via a fast cache."
 readme = "README.md"
 authors = [
-    { name = "Ra4ster", email = "jackrose2335@outlook.com" }
+    { name = "Ra4ster", email = "jackrose2335@gmail.com" }
 ]
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "numpy>=2.5.4",
+    "rich>=15.0.0",
+    "torch>=2.14.1",
+]
 
 [project.scripts]
 sphota = "sphota:main"
