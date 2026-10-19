@@ -197,6 +197,22 @@ class StreamMetrics:
                 f"adaptive {self.rate('adaptive'):.2%} | "
                 f"bpc mix {self.bpc(f'mix{live_lam}'):.3f} adaptive {self.bpc('adaptive'):.3f}")
 
+    def result(self) -> dict[str, float]:
+        """Headline numbers for sweeps: hit rates, bits/char, and the oracle ceiling."""
+        fixed = [f"mix{lam}" for lam in LAM_GRID if 0 < lam < 1]
+        best_fixed = min(fixed, key=self.bpc)
+        return {
+            "cache_hit": self.rate("cache"),
+            "pcn_hit": self.rate("pcn"),
+            "best_fixed": best_fixed,
+            "best_fixed_hit": self.rate(best_fixed),
+            "best_fixed_bpc": self.bpc(best_fixed),
+            "route_bpc": self.bpc("route"),
+            "adaptive_hit": self.rate("adaptive"),
+            "adaptive_bpc": self.bpc("adaptive"),
+            "ceiling": 1.0 - self.agree["neither"] / max(self.n, 1),
+        }
+
     def summary(self) -> str:
         lines = [f"\n[Result] {self.n} predictions over {self.chars} characters",
                  f"{'predictor':<18}{'token hit':>11}{'chars covered':>16}{'bits/char':>12}"]
@@ -235,7 +251,9 @@ class SphotaLM:
         gate_lr: float = 0.05,
         cache_temp: float = 0.05,
         cache_eps: float = 0.02,
+        seed: int = 0,
     ):
+        torch.manual_seed(seed)
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
         self.trace_decays = trace_decays
@@ -270,7 +288,7 @@ class SphotaLM:
             lmbda=0.0,
             optimizer="ADAMW",
             use_cross_entropy=True,
-            seed=0,
+            seed=seed,
         )
 
         self.cache = FastCache(ctx_dim, vocab_size, max_size=cache_size)
@@ -297,10 +315,12 @@ class SphotaLM:
         ])
 
     def stream_learn(self, stream: np.ndarray, decode_map: dict[int, str],
-                     live_lam: float = 0.5, log_every: int = 10000) -> StreamMetrics:
-        print(f"[Info] Streaming {len(stream)} tokens | trace_decays={self.trace_decays} | "
-              f"top_k={self.top_k} | pcn_sees_cache={self.pcn_sees_cache} | cache_size={self.cache.max_size} | "
-              f"gate_lr={self.gate_lr} | cache_temp={self.cache_temp} | cache_eps={self.cache_eps}")
+                     live_lam: float = 0.5, log_every: int = 10000,
+                     verbose: bool = True) -> StreamMetrics:
+        if verbose:
+            print(f"[Info] Streaming {len(stream)} tokens | trace_decays={self.trace_decays} | "
+                  f"top_k={self.top_k} | pcn_sees_cache={self.pcn_sees_cache} | cache_size={self.cache.max_size} | "
+                  f"gate_lr={self.gate_lr} | cache_temp={self.cache_temp} | cache_eps={self.cache_eps}")
 
         char_len = np.array([len(decode_map[t]) for t in range(self.vocab_size)], dtype=np.int64)
         metrics = StreamMetrics(char_len)
@@ -368,12 +388,13 @@ class SphotaLM:
             # Roll the leaky integrators (they summarise tokens before prev_token)
             traces = [d * t + (1.0 - d) * prev_emb for d, t in zip(self.trace_decays, traces)]
 
-            if i % log_every == 0:
+            if verbose and log_every and i % log_every == 0:
                 guess = decode_map.get(preds[f"mix{live_lam}"], "?")
                 actual = decode_map.get(current_token, "?")
                 print(f"{metrics.log_line(i, live_lam)} | guess {guess!r} | actual {actual!r}")
 
-        print(metrics.summary())
+        if verbose:
+            print(metrics.summary())
         return metrics
 
 
@@ -386,6 +407,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--tokenizer", choices=["char", "bpe"], default="char")
     ap.add_argument("--bpe-vocab", type=int, default=512)
     ap.add_argument("--tokens", type=int, default=0, help="stream length (0 = whole corpus)")
+    ap.add_argument("--start", type=int, default=0, help="first token of the stream segment")
+    ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--top-k", type=int, default=5)
     ap.add_argument("--trace-decays", type=str, default="0.5,0.9")
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -402,7 +425,6 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    torch.manual_seed(0)
 
     text = load_text()
     if args.tokenizer == "bpe":
@@ -410,8 +432,7 @@ if __name__ == "__main__":
     else:
         stream, vocab_size, decode_map = char_stream(text)
 
-    if args.tokens > 0:
-        stream = stream[: args.tokens]
+    stream = stream[args.start: args.start + args.tokens if args.tokens > 0 else None]
 
     model = SphotaLM(
         vocab_size=vocab_size,
@@ -423,5 +444,6 @@ if __name__ == "__main__":
         gate_lr=args.gate_lr,
         cache_temp=args.cache_temp,
         cache_eps=args.cache_eps,
+        seed=args.seed,
     )
     model.stream_learn(stream, decode_map, live_lam=args.lam, log_every=args.log_every)
