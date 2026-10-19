@@ -5,8 +5,13 @@ Two predictors run side by side on one stream, and their probabilities are mixed
   * FastCache: nearest-neighbour memory keyed on the raw context
     (previous-token embedding + leaky traces). It votes over the next tokens
     of its top-k most similar past contexts -> a distribution over the vocab.
-  * PCN (pydeepity FullPCN, cross-entropy head): logits over the vocab from the
-    same context, trained online one token at a time.
+  * Network (pydeepity FullPCN with a cross-entropy head, or --model-type mlp: a
+    plain PyTorch MLP of the same shape trained online with Adam): logits over the
+    vocab from the same context, trained online one token at a time. Its token
+    embeddings are learned online too (unless --freeze-embeddings). The cache keeps
+    keying on a frozen copy of the initial embeddings, because keys built from drifting
+    embeddings go stale. Learned-embedding gradients are exact (autograd) for the
+    MLP and a DFA-style fixed random projection of the output error for the PCN.
 
   p_mix = lam * p_pcn + (1 - lam) * p_cache
 
@@ -28,6 +33,7 @@ Usage:
 
 import argparse
 import os
+import time
 import urllib.request
 
 import numpy as np
@@ -149,8 +155,10 @@ class FastCache:
 class StreamMetrics:
     """Running accuracies, character coverage, agreement breakdown and bits/char."""
 
-    def __init__(self, char_len: np.ndarray):
+    def __init__(self, char_len: np.ndarray, net_label: str = "pcn"):
         self.char_len = char_len
+        self.net_label = net_label
+        self.tps: list[tuple[int, float]] = []      # (step, tokens/sec over the block ending there)
         self.n = 0
         self.chars = 0
         self.hits = {name: 0 for name in self.names()}
@@ -191,8 +199,9 @@ class StreamMetrics:
     def bpc(self, name: str) -> float:
         return self.bits[name] / max(self.chars, 1)
 
-    def log_line(self, step: int, live_lam: float) -> str:
-        return (f"Token {step} | cache {self.rate('cache'):.2%} | pcn {self.rate('pcn'):.2%} | "
+    def log_line(self, step: int, live_lam: float, tps: float) -> str:
+        return (f"Token {step} | {tps:.0f} tok/s | cache {self.rate('cache'):.2%} | "
+                f"{self.net_label} {self.rate('pcn'):.2%} | "
                 f"mix(lam={live_lam}) {self.rate(f'mix{live_lam}'):.2%} | "
                 f"adaptive {self.rate('adaptive'):.2%} | "
                 f"bpc mix {self.bpc(f'mix{live_lam}'):.3f} adaptive {self.bpc('adaptive'):.3f}")
@@ -216,7 +225,7 @@ class StreamMetrics:
     def summary(self) -> str:
         lines = [f"\n[Result] {self.n} predictions over {self.chars} characters",
                  f"{'predictor':<18}{'token hit':>11}{'chars covered':>16}{'bits/char':>12}"]
-        rows = [("cache only", "cache", None), ("pcn only", "pcn", "mix1.0")]
+        rows = [("cache only", "cache", None), (f"{self.net_label} only", "pcn", "mix1.0")]
         rows += [(f"mix lam={lam}", f"mix{lam}", f"mix{lam}" if lam > 0 else None) for lam in LAM_GRID]
         rows += [("route (no learn)", "route", "route"), ("adaptive gate", "adaptive", "adaptive")]
         for label, name, bits_key in rows:
@@ -227,9 +236,13 @@ class StreamMetrics:
         for name in ROUTERS:
             by_case = " | ".join(f"{k} {self.lam_sum_when[(name, k)] / max(v, 1):.3f}" for k, v in self.agree.items())
             lines.append(f"{name}: mean lam {self.lam_sum[name] / max(self.n, 1):.3f} | {by_case}")
-        lines.append("cache vs pcn: " + ", ".join(f"{k} {v / total:.2%}" for k, v in self.agree.items()))
-        lines.append(f"ceiling for any cache/pcn combination (either right): "
+        lines.append(f"cache vs {self.net_label}: " + ", ".join(f"{k} {v / total:.2%}" for k, v in self.agree.items()))
+        lines.append(f"ceiling for any cache/{self.net_label} combination (either right): "
                      f"{(total - self.agree['neither']) / total:.2%}")
+        if self.tps:
+            (_, first), (_, last) = self.tps[0], self.tps[-1]
+            lines.append(f"throughput: first block {first:.0f} tok/s | last block {last:.0f} tok/s | "
+                         f"last/first {last / first:.2f} (first block includes warm-up)")
         return "\n".join(lines)
 
 
@@ -252,8 +265,15 @@ class SphotaLM:
         cache_temp: float = 0.05,
         cache_eps: float = 0.02,
         seed: int = 0,
+        model_type: str = "pcn",
+        learn_embeddings: bool = False,
+        embed_lr: float = 3.3e-5,
     ):
         torch.manual_seed(seed)
+        if model_type not in ("pcn", "mlp"):
+            raise ValueError(f"model_type must be 'pcn' or 'mlp', got {model_type!r}")
+        self.model_type = model_type
+        self.learn_embeddings = learn_embeddings
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
         self.trace_decays = trace_decays
@@ -267,29 +287,47 @@ class SphotaLM:
         # Zero init -> lam = 0.5 until the gate has seen evidence.
         self.gate_w = torch.zeros(N_GATE_FEATURES, device="cuda")
 
-        # Fixed random token codes (never trained).
+        # Token codes the network reads. They are learned online when learn_embeddings is
+        # set; the cache always keys on a frozen copy of the initial codes so stored keys
+        # never go stale.
         self.embedding = nn.Embedding(vocab_size, embed_dim).cuda()
-        self.emb_table = self.embedding.weight.detach()
+        self.cache_table = self.embedding.weight.detach().clone()
+        self.embedding.weight.requires_grad_(learn_embeddings)
+        if learn_embeddings:
+            self.embed_opt = torch.optim.Adam([self.embedding.weight], lr=embed_lr)
+        if learn_embeddings and model_type == "pcn":
+            # The PCN returns no input gradient, so its embeddings get a DFA-style update:
+            # a fixed random projection of the output error onto the embedding space.
+            gen = torch.Generator(device="cuda").manual_seed(seed)
+            self.dfa_proj = torch.randn(vocab_size, embed_dim, device="cuda", generator=gen) / np.sqrt(vocab_size)
 
         ctx_dim = embed_dim * (1 + len(trace_decays))
-        pcn_in_dim = ctx_dim + (embed_dim if pcn_sees_cache else 0)
+        net_in_dim = ctx_dim + (embed_dim if pcn_sees_cache else 0)
 
-        self.pcn = pd.FullPCN(
-            Linear(pcn_in_dim, latent_dim),
-            ReLU(),
-            Linear(latent_dim, vocab_size),
-            batch_size=1,
-            device="cuda"
-        )
-        self.pcn.configure(
-            learning_rate=learning_rate,
-            inference_rate=0.1,
-            feedback_rate=1e-4,
-            lmbda=0.0,
-            optimizer="ADAMW",
-            use_cross_entropy=True,
-            seed=seed,
-        )
+        if model_type == "pcn":
+            self.pcn = pd.FullPCN(
+                Linear(net_in_dim, latent_dim),
+                ReLU(),
+                Linear(latent_dim, vocab_size),
+                batch_size=1,
+                device="cuda"
+            )
+            self.pcn.configure(
+                learning_rate=learning_rate,
+                inference_rate=0.1,
+                feedback_rate=1e-4,
+                lmbda=0.0,
+                optimizer="ADAMW",
+                use_cross_entropy=True,
+                seed=seed,
+            )
+        else:
+            self.mlp = nn.Sequential(
+                nn.Linear(net_in_dim, latent_dim),
+                nn.ReLU(),
+                nn.Linear(latent_dim, vocab_size),
+            ).cuda()
+            self.net_opt = torch.optim.Adam(self.mlp.parameters(), lr=learning_rate)
 
         self.cache = FastCache(ctx_dim, vocab_size, max_size=cache_size)
 
@@ -320,32 +358,49 @@ class SphotaLM:
         if verbose:
             print(f"[Info] Streaming {len(stream)} tokens | trace_decays={self.trace_decays} | "
                   f"top_k={self.top_k} | pcn_sees_cache={self.pcn_sees_cache} | cache_size={self.cache.max_size} | "
-                  f"gate_lr={self.gate_lr} | cache_temp={self.cache_temp} | cache_eps={self.cache_eps}")
+                  f"gate_lr={self.gate_lr} | cache_temp={self.cache_temp} | cache_eps={self.cache_eps}\n"
+                  f"       model={self.model_type} | learn_embeddings={self.learn_embeddings}")
 
         char_len = np.array([len(decode_map[t]) for t in range(self.vocab_size)], dtype=np.int64)
-        metrics = StreamMetrics(char_len)
-        traces = [torch.zeros(1, self.embed_dim, device="cuda") for _ in self.trace_decays]
+        metrics = StreamMetrics(char_len, net_label=self.model_type)
+        # Leaky traces of the frozen codes (cache keys) and, when embeddings are learned,
+        # of the learned codes as they were when each token went by (network input).
+        cache_traces = [torch.zeros(1, self.embed_dim, device="cuda") for _ in self.trace_decays]
+        net_traces = [torch.zeros(1, self.embed_dim, device="cuda") for _ in self.trace_decays]
         one_hot = np.zeros((1, self.vocab_size), dtype=np.float32)
+        block_start, block_step = time.perf_counter(), 0
 
         for i in range(1, len(stream)):
             prev_token = int(stream[i - 1])
             current_token = int(stream[i])
 
-            prev_emb = self.emb_table[prev_token].unsqueeze(0)
-            context = torch.cat([prev_emb, *traces], dim=1)
+            cache_prev = self.cache_table[prev_token].unsqueeze(0)
+            context = torch.cat([cache_prev, *cache_traces], dim=1)
 
             # Cache vote
             votes, cache_pred, top_scores = self.cache.vote(context, self.top_k, self.cache_temp)
             p_cache = (1.0 - self.cache_eps) * votes + self.cache_eps / self.vocab_size
 
-            # PCN logits (0 settling steps = plain feed-forward readout)
-            pcn_input = context
+            # Network logits. The learned embedding row is the only part of the input that
+            # carries a gradient; traces are constants.
+            if self.learn_embeddings:
+                net_prev = self.embedding.weight[prev_token].unsqueeze(0)
+                net_prev_val = net_prev.detach().clone()
+                net_input = torch.cat([net_prev, *net_traces], dim=1)
+            else:
+                net_prev_val = cache_prev
+                net_input = context
             if self.pcn_sees_cache:
-                pcn_input = torch.cat([context, self.emb_table[cache_pred].unsqueeze(0)], dim=1)
-            x_np = pcn_input.cpu().numpy().astype(np.float32)
+                net_input = torch.cat([net_input, self.cache_table[cache_pred].unsqueeze(0)], dim=1)
 
-            logits_np = self.pcn.predict(x_np, inference_steps=0).reshape(1, -1).astype(np.float32)
-            p_pcn = F.softmax(torch.from_numpy(logits_np).cuda(), dim=1).squeeze(0)
+            if self.model_type == "mlp":
+                logits = self.mlp(net_input)
+                p_pcn = F.softmax(logits.detach(), dim=1).squeeze(0)
+            else:
+                # 0 settling steps = plain feed-forward readout
+                x_np = net_input.detach().cpu().numpy().astype(np.float32)
+                logits_np = self.pcn.predict(x_np, inference_steps=0).reshape(1, -1).astype(np.float32)
+                p_pcn = F.softmax(torch.from_numpy(logits_np).cuda(), dim=1).squeeze(0)
 
             # Routers: per-token lam from cache/PCN confidence
             feats = self.gate_features(votes, p_pcn, top_scores, cache_pred)
@@ -381,17 +436,41 @@ class SphotaLM:
 
             # Learn
             self.cache.imprint(context, current_token)
-            one_hot[:] = 0.0
-            one_hot[0, current_token] = 1.0
-            self.pcn.train_step(x_np, one_hot, inference_steps=1)
+            if self.model_type == "mlp":
+                target = torch.tensor([current_token], device="cuda")
+                self.net_opt.zero_grad()
+                if self.learn_embeddings:
+                    self.embed_opt.zero_grad()
+                F.cross_entropy(logits, target).backward()
+                self.net_opt.step()
+                if self.learn_embeddings:
+                    self.embed_opt.step()
+            else:
+                one_hot[:] = 0.0
+                one_hot[0, current_token] = 1.0
+                self.pcn.train_step(x_np, one_hot, inference_steps=1)
+                if self.learn_embeddings:
+                    err = p_pcn.clone()
+                    err[current_token] -= 1.0                       # softmax - onehot
+                    grad = torch.zeros_like(self.embedding.weight)
+                    grad[prev_token] = err @ self.dfa_proj
+                    self.embedding.weight.grad = grad
+                    self.embed_opt.step()
 
             # Roll the leaky integrators (they summarise tokens before prev_token)
-            traces = [d * t + (1.0 - d) * prev_emb for d, t in zip(self.trace_decays, traces)]
+            cache_traces = [d * t + (1.0 - d) * cache_prev for d, t in zip(self.trace_decays, cache_traces)]
+            if self.learn_embeddings:
+                net_traces = [d * t + (1.0 - d) * net_prev_val for d, t in zip(self.trace_decays, net_traces)]
 
-            if verbose and log_every and i % log_every == 0:
-                guess = decode_map.get(preds[f"mix{live_lam}"], "?")
-                actual = decode_map.get(current_token, "?")
-                print(f"{metrics.log_line(i, live_lam)} | guess {guess!r} | actual {actual!r}")
+            if log_every and i % log_every == 0:
+                now = time.perf_counter()
+                tps = (i - block_step) / (now - block_start)
+                metrics.tps.append((i, tps))
+                block_start, block_step = now, i
+                if verbose:
+                    guess = decode_map.get(preds[f"mix{live_lam}"], "?")
+                    actual = decode_map.get(current_token, "?")
+                    print(f"{metrics.log_line(i, live_lam, tps)} | guess {guess!r} | actual {actual!r}")
 
         if verbose:
             print(metrics.summary())
@@ -411,7 +490,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--top-k", type=int, default=5)
     ap.add_argument("--trace-decays", type=str, default="0.5,0.9")
-    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--model-type", choices=["pcn", "mlp"], default="pcn",
+                    help="pcn = pydeepity FullPCN; mlp = same-shape PyTorch MLP trained online with Adam")
+    ap.add_argument("--lr", type=float, default=3.3e-5, help="network learning rate")
+    ap.add_argument("--embed-lr", type=float, default=3.3e-5, help="learning rate of the learned token embeddings")
+    ap.add_argument("--freeze-embeddings", action="store_true",
+                    help="keep the token codes fixed random (reproduces the earlier frozen runs; use --lr 1e-3)")
     ap.add_argument("--cache-temp", type=float, default=0.05,
                     help="similarity weighting of cache votes, exp(score/temp); 0 = plain counts")
     ap.add_argument("--cache-eps", type=float, default=0.02, help="uniform smoothing mass on the cache distribution")
@@ -445,5 +529,8 @@ if __name__ == "__main__":
         cache_temp=args.cache_temp,
         cache_eps=args.cache_eps,
         seed=args.seed,
+        model_type=args.model_type,
+        learn_embeddings=not args.freeze_embeddings,
+        embed_lr=args.embed_lr,
     )
     model.stream_learn(stream, decode_map, live_lam=args.lam, log_every=args.log_every)
