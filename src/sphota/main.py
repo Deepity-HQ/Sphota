@@ -268,12 +268,16 @@ class SphotaLM:
         model_type: str = "pcn",
         learn_embeddings: bool = False,
         embed_lr: float = 3.3e-5,
+        pcn_epc: bool = False,
+        pcn_inference_rate: float = 0.1,
     ):
         torch.manual_seed(seed)
         if model_type not in ("pcn", "mlp"):
             raise ValueError(f"model_type must be 'pcn' or 'mlp', got {model_type!r}")
         self.model_type = model_type
         self.learn_embeddings = learn_embeddings
+        self.pcn_epc = pcn_epc
+        self.pcn_inference_rate = pcn_inference_rate
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
         self.trace_decays = trace_decays
@@ -314,10 +318,11 @@ class SphotaLM:
             )
             self.pcn.configure(
                 learning_rate=learning_rate,
-                inference_rate=0.1,
+                inference_rate=pcn_inference_rate,
                 feedback_rate=1e-4,
                 lmbda=0.0,
                 optimizer="ADAMW",
+                use_epc=pcn_epc,
                 use_cross_entropy=True,
                 seed=seed,
             )
@@ -359,7 +364,8 @@ class SphotaLM:
             print(f"[Info] Streaming {len(stream)} tokens | trace_decays={self.trace_decays} | "
                   f"top_k={self.top_k} | pcn_sees_cache={self.pcn_sees_cache} | cache_size={self.cache.max_size} | "
                   f"gate_lr={self.gate_lr} | cache_temp={self.cache_temp} | cache_eps={self.cache_eps}\n"
-                  f"       model={self.model_type} | learn_embeddings={self.learn_embeddings}")
+                  f"       model={self.model_type} | learn_embeddings={self.learn_embeddings} | "
+                  f"pcn_epc={self.pcn_epc} | pcn_inference_rate={self.pcn_inference_rate}")
 
         char_len = np.array([len(decode_map[t]) for t in range(self.vocab_size)], dtype=np.int64)
         metrics = StreamMetrics(char_len, net_label=self.model_type)
@@ -492,6 +498,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--trace-decays", type=str, default="0.5,0.9")
     ap.add_argument("--model-type", choices=["pcn", "mlp"], default="pcn",
                     help="pcn = pydeepity FullPCN; mlp = same-shape PyTorch MLP trained online with Adam")
+    ap.add_argument("--pcn-epc", action="store_true",
+                    help="error-based PC: each settling step is a full forward+backward sweep (diagnostic; "
+                         "not layer-local, so it is not the DKP O(1)-depth setting)")
+    ap.add_argument("--pcn-inference-rate", type=float, default=0.1, help="PCN settling rate")
     ap.add_argument("--lr", type=float, default=3.3e-5, help="network learning rate")
     ap.add_argument("--embed-lr", type=float, default=3.3e-5, help="learning rate of the learned token embeddings")
     ap.add_argument("--freeze-embeddings", action="store_true",
@@ -532,5 +542,7 @@ if __name__ == "__main__":
         model_type=args.model_type,
         learn_embeddings=not args.freeze_embeddings,
         embed_lr=args.embed_lr,
+        pcn_epc=args.pcn_epc,
+        pcn_inference_rate=args.pcn_inference_rate,
     )
     model.stream_learn(stream, decode_map, live_lam=args.lam, log_every=args.log_every)
