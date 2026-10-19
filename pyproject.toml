@@ -6,10 +6,12 @@ readme = "README.md"
 authors = [
     { name = "Ra4ster", email = "jackrose2335@gmail.com" }
 ]
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 dependencies = [
+    "datasets>=5.1.0",
     "numpy>=2.5.4",
     "rich>=15.0.0",
+    "tokenizers>=0.23.3",
     "torch>=2.14.1",
 ]
 
