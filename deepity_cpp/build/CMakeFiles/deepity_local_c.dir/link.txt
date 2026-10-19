@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC -O3 -DNDEBUG -shared -Wl,--dependency-file=CMakeFiles/deepity_local_c.dir/link.d -Wl,-soname,libdeepity_local_c.so -o libdeepity_local_c.so CMakeFiles/deepity_local_c.dir/src/c_api.cpp.o

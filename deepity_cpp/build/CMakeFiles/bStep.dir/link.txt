@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/bStep.dir/link.d CMakeFiles/bStep.dir/bench/bStep.cpp.o -o bin/bStep

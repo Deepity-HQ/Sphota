@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/tRings.dir/link.d CMakeFiles/tRings.dir/tests/tRings.cpp.o -o bin/tRings

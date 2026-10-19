@@ -10,6 +10,12 @@ Two predictors run side by side on one stream, and their probabilities are mixed
 
   p_mix = lam * p_pcn + (1 - lam) * p_cache
 
+lam is swept over a fixed grid, and also set per token by two routers:
+  * route:    lam = 1 - (largest share of the top-k votes), no learning.
+  * adaptive: lam = sigmoid(w . f), where f holds the cache's vote consensus and
+              entropy and the PCN's own confidence. w is learned online by SGD on
+              the mixture's log-loss, so the gate directly minimises bits/char.
+
 Metrics are reported for the cache alone, the PCN alone, and the mixture at
 several lam values, as token hit rate, share of characters inside correctly
 predicted tokens, and bits per character (tokenizer-independent).
@@ -35,6 +41,8 @@ from pydeepity.layer import Linear, ReLU
 DATA_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
 DATA_PATH = "tiny_shakespeare.txt"
 LAM_GRID = (0.0, 0.25, 0.5, 0.75, 1.0)
+ROUTERS = ("route", "adaptive")
+N_GATE_FEATURES = 5
 
 
 # ----------------------------------------------------------------------------
@@ -141,14 +149,18 @@ class StreamMetrics:
         self.chars = 0
         self.hits = {name: 0 for name in self.names()}
         self.hit_chars = {name: 0 for name in self.names()}
-        self.bits = {lam: 0.0 for lam in LAM_GRID if lam > 0}
+        self.bits = {name: 0.0 for name in self.names() if name != "cache"}
+        self.lam_sum = {name: 0.0 for name in ROUTERS}
+        self.lam_sum_when = {(name, ok): 0.0 for name in ROUTERS for ok in (True, False)}
+        self.n_when = {True: 0, False: 0}
         self.agree = {"both": 0, "cache_only": 0, "pcn_only": 0, "neither": 0}
 
     @staticmethod
     def names() -> list[str]:
-        return ["cache", "pcn"] + [f"mix{lam}" for lam in LAM_GRID]
+        return ["cache", "pcn"] + [f"mix{lam}" for lam in LAM_GRID] + list(ROUTERS)
 
-    def update(self, actual: int, preds: dict[str, int], p_true: dict[float, float]) -> None:
+    def update(self, actual: int, preds: dict[str, int], p_true: dict[str, float],
+               lams: dict[str, float]) -> None:
         n_chars = int(self.char_len[actual])
         self.n += 1
         self.chars += n_chars
@@ -158,34 +170,44 @@ class StreamMetrics:
                 self.hits[name] += 1
                 self.hit_chars[name] += n_chars
 
-        for lam, p in p_true.items():
-            self.bits[lam] -= np.log2(max(p, 1e-12))
+        for name, p in p_true.items():
+            self.bits[name] -= np.log2(max(p, 1e-12))
 
         c, p = preds["cache"] == actual, preds["pcn"] == actual
+        self.n_when[c] += 1
+        for name, lam in lams.items():
+            self.lam_sum[name] += lam
+            self.lam_sum_when[(name, c)] += lam
         key = "both" if c and p else "cache_only" if c else "pcn_only" if p else "neither"
         self.agree[key] += 1
 
     def rate(self, name: str) -> float:
         return self.hits[name] / max(self.n, 1)
 
-    def bpc(self, lam: float) -> float:
-        return self.bits[lam] / max(self.chars, 1)
+    def bpc(self, name: str) -> float:
+        return self.bits[name] / max(self.chars, 1)
 
     def log_line(self, step: int, live_lam: float) -> str:
         return (f"Token {step} | cache {self.rate('cache'):.2%} | pcn {self.rate('pcn'):.2%} | "
                 f"mix(lam={live_lam}) {self.rate(f'mix{live_lam}'):.2%} | "
-                f"bpc(lam={live_lam}) {self.bpc(live_lam):.3f}")
+                f"adaptive {self.rate('adaptive'):.2%} | "
+                f"bpc mix {self.bpc(f'mix{live_lam}'):.3f} adaptive {self.bpc('adaptive'):.3f}")
 
     def summary(self) -> str:
         lines = [f"\n[Result] {self.n} predictions over {self.chars} characters",
                  f"{'predictor':<18}{'token hit':>11}{'chars covered':>16}{'bits/char':>12}"]
-        rows = [("cache only", "cache", None), ("pcn only", "pcn", 1.0)]
-        rows += [(f"mix lam={lam}", f"mix{lam}", lam if lam > 0 else None) for lam in LAM_GRID]
-        for label, name, lam in rows:
-            bpc = f"{self.bpc(lam):.3f}" if lam is not None else "--"
+        rows = [("cache only", "cache", None), ("pcn only", "pcn", "mix1.0")]
+        rows += [(f"mix lam={lam}", f"mix{lam}", f"mix{lam}" if lam > 0 else None) for lam in LAM_GRID]
+        rows += [("route (no learn)", "route", "route"), ("adaptive gate", "adaptive", "adaptive")]
+        for label, name, bits_key in rows:
+            bpc = f"{self.bpc(bits_key):.3f}" if bits_key is not None else "--"
             lines.append(f"{label:<18}{self.rate(name):>11.2%}"
                          f"{self.hit_chars[name] / max(self.chars, 1):>16.2%}{bpc:>12}")
         total = max(self.n, 1)
+        for name in ROUTERS:
+            lines.append(f"{name}: mean lam {self.lam_sum[name] / max(self.n, 1):.3f} | "
+                         f"when cache right {self.lam_sum_when[(name, True)] / max(self.n_when[True], 1):.3f} | "
+                         f"when cache wrong {self.lam_sum_when[(name, False)] / max(self.n_when[False], 1):.3f}")
         lines.append("cache vs pcn: " + ", ".join(f"{k} {v / total:.2%}" for k, v in self.agree.items()))
         lines.append(f"ceiling for any cache/pcn combination (either right): "
                      f"{(total - self.agree['neither']) / total:.2%}")
@@ -207,12 +229,18 @@ class SphotaLM:
         learning_rate: float = 1e-3,
         pcn_sees_cache: bool = False,
         cache_size: int = 50000,
+        gate_lr: float = 0.05,
     ):
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
         self.trace_decays = trace_decays
         self.top_k = top_k
         self.pcn_sees_cache = pcn_sees_cache
+        self.gate_lr = gate_lr
+
+        # Gate weights over [cache max share, cache entropy, pcn max prob, pcn entropy, bias].
+        # Zero init -> lam = 0.5 until the gate has seen evidence.
+        self.gate_w = torch.zeros(N_GATE_FEATURES, device="cuda")
 
         # Fixed random token codes (never trained).
         self.embedding = nn.Embedding(vocab_size, embed_dim).cuda()
@@ -240,10 +268,24 @@ class SphotaLM:
 
         self.cache = FastCache(ctx_dim, vocab_size, max_size=cache_size)
 
+    def gate_features(self, p_cache: torch.Tensor, p_pcn: torch.Tensor) -> torch.Tensor:
+        """Confidence features for the gate, all in [0, 1]."""
+        def entropy(p: torch.Tensor, norm: float) -> torch.Tensor:
+            return -(p * torch.log(p.clamp_min(1e-12))).sum() / norm
+
+        return torch.stack([
+            p_cache.max(),
+            entropy(p_cache, np.log(max(self.top_k, 2))),   # votes live on <= top_k tokens
+            p_pcn.max(),
+            entropy(p_pcn, np.log(self.vocab_size)),
+            torch.ones((), device="cuda"),
+        ])
+
     def stream_learn(self, stream: np.ndarray, decode_map: dict[int, str],
                      live_lam: float = 0.5, log_every: int = 10000) -> StreamMetrics:
         print(f"[Info] Streaming {len(stream)} tokens | trace_decays={self.trace_decays} | "
-              f"top_k={self.top_k} | pcn_sees_cache={self.pcn_sees_cache} | cache_size={self.cache.max_size}")
+              f"top_k={self.top_k} | pcn_sees_cache={self.pcn_sees_cache} | cache_size={self.cache.max_size} | "
+              f"gate_lr={self.gate_lr}")
 
         char_len = np.array([len(decode_map[t]) for t in range(self.vocab_size)], dtype=np.int64)
         metrics = StreamMetrics(char_len)
@@ -269,20 +311,37 @@ class SphotaLM:
             logits_np = self.pcn.predict(x_np, inference_steps=0).reshape(1, -1).astype(np.float32)
             p_pcn = F.softmax(torch.from_numpy(logits_np).cuda(), dim=1).squeeze(0)
 
+            # Routers: per-token lam from cache/PCN confidence
+            feats = self.gate_features(p_cache, p_pcn)
+            lam_route = 1.0 - feats[0]
+            lam_gate = torch.sigmoid(self.gate_w @ feats)
+
             # Mixtures, gathered in one GPU->CPU transfer
-            mixes = [lam * p_pcn + (1.0 - lam) * p_cache for lam in LAM_GRID]
+            lams = [*LAM_GRID, lam_route, lam_gate]
+            mixes = [lam * p_pcn + (1.0 - lam) * p_cache for lam in lams]
             floor = 1e-4 / self.vocab_size
+            probs = [(1 - 1e-4) * m[current_token] + floor for m in mixes]
             stacked = torch.stack(
                 [cache_pred.float(), torch.argmax(p_pcn).float()]
                 + [torch.argmax(m).float() for m in mixes]
-                + [(1 - 1e-4) * m[current_token] + floor for m in mixes]
+                + [p for j, p in enumerate(probs) if not (j < len(LAM_GRID) and LAM_GRID[j] == 0)]
+                + [lam_route, lam_gate]
             ).tolist()
 
-            n_lam = len(LAM_GRID)
+            names = [f"mix{lam}" for lam in LAM_GRID] + list(ROUTERS)
+            n_mix = len(names)
             preds = {"cache": int(stacked[0]), "pcn": int(stacked[1])}
-            preds.update({f"mix{lam}": int(stacked[2 + j]) for j, lam in enumerate(LAM_GRID)})
-            p_true = {lam: stacked[2 + n_lam + j] for j, lam in enumerate(LAM_GRID) if lam > 0}
-            metrics.update(current_token, preds, p_true)
+            preds.update({name: int(stacked[2 + j]) for j, name in enumerate(names)})
+            scored = [name for j, name in enumerate(names) if not (j < len(LAM_GRID) and LAM_GRID[j] == 0)]
+            p_true = {name: stacked[2 + n_mix + j] for j, name in enumerate(scored)}
+            lam_vals = dict(zip(ROUTERS, stacked[-2:]))
+            metrics.update(current_token, preds, p_true, lam_vals)
+
+            # Gate SGD step on -log p_mix(true): dL/dz = -(pp - pc) / p_mix * lam * (1 - lam)
+            p_c, p_p = p_cache[current_token], p_pcn[current_token]
+            p_m = (lam_gate * p_p + (1.0 - lam_gate) * p_c).clamp_min(1e-12)
+            grad_z = -(p_p - p_c) / p_m * lam_gate * (1.0 - lam_gate)
+            self.gate_w -= self.gate_lr * grad_z * feats
 
             # Learn
             self.cache.imprint(context, current_token)
@@ -314,6 +373,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--top-k", type=int, default=5)
     ap.add_argument("--trace-decays", type=str, default="0.5,0.9")
     ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--gate-lr", type=float, default=0.05, help="SGD rate of the adaptive lam gate")
     ap.add_argument("--lam", type=float, default=0.5, choices=LAM_GRID, help="mixture weight shown live")
     ap.add_argument("--pcn-sees-cache", action="store_true",
                     help="also feed the cache's guess into the PCN (default off, keeps the two independent)")
@@ -341,5 +401,6 @@ if __name__ == "__main__":
         learning_rate=args.lr,
         pcn_sees_cache=args.pcn_sees_cache,
         cache_size=len(stream),
+        gate_lr=args.gate_lr,
     )
     model.stream_learn(stream, decode_map, live_lam=args.lam, log_every=args.log_every)
