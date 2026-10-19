@@ -42,7 +42,7 @@ DATA_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tiny
 DATA_PATH = "tiny_shakespeare.txt"
 LAM_GRID = (0.0, 0.25, 0.5, 0.75, 1.0)
 ROUTERS = ("route", "adaptive")
-N_GATE_FEATURES = 5
+N_GATE_FEATURES = 9
 
 
 # ----------------------------------------------------------------------------
@@ -108,26 +108,32 @@ class FastCache:
         self.size = 0
         self.ptr = 0
 
-    def vote(self, query: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Returns (distribution over vocab, predicted token), both on GPU.
+    def vote(self, query: torch.Tensor, k: int, temp: float = 0.0
+             ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns (vote distribution, predicted token, top-k cosine scores), all on GPU.
 
-        The distribution is the share of the top-k neighbours voting for each token.
-        The prediction is the most-voted token, ties broken toward the most similar key.
-        With an empty cache the distribution is uniform and the prediction is token 0.
+        The distribution is the weighted share of the top-k neighbours voting for each
+        token; weights are exp((score - best) / temp), or uniform when temp <= 0. It is
+        unsmoothed, so tokens nobody voted for get exactly zero.
+        The prediction is the most-voted token.
+        With an empty cache the distribution is uniform, the prediction is token 0 and
+        the scores are zero.
         """
         if self.size == 0:
             uniform = torch.full((self.vocab_size,), 1.0 / self.vocab_size, device="cuda")
-            return uniform, torch.zeros((), dtype=torch.long, device="cuda")
+            return uniform, torch.zeros((), dtype=torch.long, device="cuda"), torch.zeros(k, device="cuda")
 
         q = F.normalize(query, p=2, dim=1).squeeze(0)
         scores = self.keys[: self.size] @ q
 
-        k = min(k, self.size)
-        top = torch.topk(scores, k).indices                     # most similar first
+        want_k, k = k, min(k, self.size)
+        top_scores, top = torch.topk(scores, k)                 # most similar first
         candidates = self.next_tokens[top]
-        counts = torch.bincount(candidates, minlength=self.vocab_size).float()
-        pred = candidates[torch.argmax(counts[candidates])]     # first max = most similar
-        return counts / k, pred
+        weights = (torch.exp((top_scores - top_scores[0]) / temp) if temp > 0
+                   else torch.ones_like(top_scores))
+        votes = torch.zeros(self.vocab_size, device="cuda").index_add_(0, candidates, weights)
+        votes = votes / votes.sum()
+        return votes, torch.argmax(votes), F.pad(top_scores, (0, want_k - k))  # always want_k scores
 
     def imprint(self, key: torch.Tensor, next_token: int) -> None:
         self.keys[self.ptr] = F.normalize(key, p=2, dim=1).squeeze(0)
@@ -151,9 +157,8 @@ class StreamMetrics:
         self.hit_chars = {name: 0 for name in self.names()}
         self.bits = {name: 0.0 for name in self.names() if name != "cache"}
         self.lam_sum = {name: 0.0 for name in ROUTERS}
-        self.lam_sum_when = {(name, ok): 0.0 for name in ROUTERS for ok in (True, False)}
-        self.n_when = {True: 0, False: 0}
         self.agree = {"both": 0, "cache_only": 0, "pcn_only": 0, "neither": 0}
+        self.lam_sum_when = {(name, k): 0.0 for name in ROUTERS for k in self.agree}
 
     @staticmethod
     def names() -> list[str]:
@@ -174,12 +179,11 @@ class StreamMetrics:
             self.bits[name] -= np.log2(max(p, 1e-12))
 
         c, p = preds["cache"] == actual, preds["pcn"] == actual
-        self.n_when[c] += 1
-        for name, lam in lams.items():
-            self.lam_sum[name] += lam
-            self.lam_sum_when[(name, c)] += lam
         key = "both" if c and p else "cache_only" if c else "pcn_only" if p else "neither"
         self.agree[key] += 1
+        for name, lam in lams.items():
+            self.lam_sum[name] += lam
+            self.lam_sum_when[(name, key)] += lam
 
     def rate(self, name: str) -> float:
         return self.hits[name] / max(self.n, 1)
@@ -205,9 +209,8 @@ class StreamMetrics:
                          f"{self.hit_chars[name] / max(self.chars, 1):>16.2%}{bpc:>12}")
         total = max(self.n, 1)
         for name in ROUTERS:
-            lines.append(f"{name}: mean lam {self.lam_sum[name] / max(self.n, 1):.3f} | "
-                         f"when cache right {self.lam_sum_when[(name, True)] / max(self.n_when[True], 1):.3f} | "
-                         f"when cache wrong {self.lam_sum_when[(name, False)] / max(self.n_when[False], 1):.3f}")
+            by_case = " | ".join(f"{k} {self.lam_sum_when[(name, k)] / max(v, 1):.3f}" for k, v in self.agree.items())
+            lines.append(f"{name}: mean lam {self.lam_sum[name] / max(self.n, 1):.3f} | {by_case}")
         lines.append("cache vs pcn: " + ", ".join(f"{k} {v / total:.2%}" for k, v in self.agree.items()))
         lines.append(f"ceiling for any cache/pcn combination (either right): "
                      f"{(total - self.agree['neither']) / total:.2%}")
@@ -230,6 +233,8 @@ class SphotaLM:
         pcn_sees_cache: bool = False,
         cache_size: int = 50000,
         gate_lr: float = 0.05,
+        cache_temp: float = 0.05,
+        cache_eps: float = 0.02,
     ):
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
@@ -237,8 +242,10 @@ class SphotaLM:
         self.top_k = top_k
         self.pcn_sees_cache = pcn_sees_cache
         self.gate_lr = gate_lr
+        self.cache_temp = cache_temp
+        self.cache_eps = cache_eps
 
-        # Gate weights over [cache max share, cache entropy, pcn max prob, pcn entropy, bias].
+        # Gate weights over the features in gate_features (last one is the bias).
         # Zero init -> lam = 0.5 until the gate has seen evidence.
         self.gate_w = torch.zeros(N_GATE_FEATURES, device="cuda")
 
@@ -268,16 +275,24 @@ class SphotaLM:
 
         self.cache = FastCache(ctx_dim, vocab_size, max_size=cache_size)
 
-    def gate_features(self, p_cache: torch.Tensor, p_pcn: torch.Tensor) -> torch.Tensor:
-        """Confidence features for the gate, all in [0, 1]."""
+    def gate_features(self, votes: torch.Tensor, p_pcn: torch.Tensor, top_scores: torch.Tensor,
+                      cache_pred: torch.Tensor) -> torch.Tensor:
+        """Confidence and cross-check features for the gate, roughly in [0, 1].
+
+        votes is the raw (unsmoothed) cache vote distribution.
+        """
         def entropy(p: torch.Tensor, norm: float) -> torch.Tensor:
             return -(p * torch.log(p.clamp_min(1e-12))).sum() / norm
 
         return torch.stack([
-            p_cache.max(),
-            entropy(p_cache, np.log(max(self.top_k, 2))),   # votes live on <= top_k tokens
+            votes.max(),                                            # vote consensus
+            entropy(votes, np.log(max(self.top_k, 2))),             # votes live on <= top_k tokens
+            top_scores[0],                                          # best cosine match
+            10.0 * (top_scores[0] - top_scores[-1]),                # drop-off from 1st to k-th match
             p_pcn.max(),
             entropy(p_pcn, np.log(self.vocab_size)),
+            p_pcn[cache_pred],                                      # does the PCN back the cache's guess?
+            (torch.argmax(p_pcn) == cache_pred).float(),            # hard argmax agreement
             torch.ones((), device="cuda"),
         ])
 
@@ -285,7 +300,7 @@ class SphotaLM:
                      live_lam: float = 0.5, log_every: int = 10000) -> StreamMetrics:
         print(f"[Info] Streaming {len(stream)} tokens | trace_decays={self.trace_decays} | "
               f"top_k={self.top_k} | pcn_sees_cache={self.pcn_sees_cache} | cache_size={self.cache.max_size} | "
-              f"gate_lr={self.gate_lr}")
+              f"gate_lr={self.gate_lr} | cache_temp={self.cache_temp} | cache_eps={self.cache_eps}")
 
         char_len = np.array([len(decode_map[t]) for t in range(self.vocab_size)], dtype=np.int64)
         metrics = StreamMetrics(char_len)
@@ -300,7 +315,8 @@ class SphotaLM:
             context = torch.cat([prev_emb, *traces], dim=1)
 
             # Cache vote
-            p_cache, cache_pred = self.cache.vote(context, self.top_k)
+            votes, cache_pred, top_scores = self.cache.vote(context, self.top_k, self.cache_temp)
+            p_cache = (1.0 - self.cache_eps) * votes + self.cache_eps / self.vocab_size
 
             # PCN logits (0 settling steps = plain feed-forward readout)
             pcn_input = context
@@ -312,7 +328,7 @@ class SphotaLM:
             p_pcn = F.softmax(torch.from_numpy(logits_np).cuda(), dim=1).squeeze(0)
 
             # Routers: per-token lam from cache/PCN confidence
-            feats = self.gate_features(p_cache, p_pcn)
+            feats = self.gate_features(votes, p_pcn, top_scores, cache_pred)
             lam_route = 1.0 - feats[0]
             lam_gate = torch.sigmoid(self.gate_w @ feats)
 
@@ -373,6 +389,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--top-k", type=int, default=5)
     ap.add_argument("--trace-decays", type=str, default="0.5,0.9")
     ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--cache-temp", type=float, default=0.05,
+                    help="similarity weighting of cache votes, exp(score/temp); 0 = plain counts")
+    ap.add_argument("--cache-eps", type=float, default=0.02, help="uniform smoothing mass on the cache distribution")
     ap.add_argument("--gate-lr", type=float, default=0.05, help="SGD rate of the adaptive lam gate")
     ap.add_argument("--lam", type=float, default=0.5, choices=LAM_GRID, help="mixture weight shown live")
     ap.add_argument("--pcn-sees-cache", action="store_true",
@@ -402,5 +421,7 @@ if __name__ == "__main__":
         pcn_sees_cache=args.pcn_sees_cache,
         cache_size=len(stream),
         gate_lr=args.gate_lr,
+        cache_temp=args.cache_temp,
+        cache_eps=args.cache_eps,
     )
     model.stream_learn(stream, decode_map, live_lam=args.lam, log_every=args.log_every)
