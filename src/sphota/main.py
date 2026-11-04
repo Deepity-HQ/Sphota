@@ -41,11 +41,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import pydeepity as pd
-from pydeepity.layer import Linear, ReLU
+from sphota.cache_bench import HashedInterpNgram, InterpNgram
 
 DATA_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
 DATA_PATH = "tiny_shakespeare.txt"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"   # the PCN needs cuda; the mlp runs anywhere
 LAM_GRID = (0.0, 0.25, 0.5, 0.75, 1.0)
 ROUTERS = ("route", "adaptive")
 N_GATE_FEATURES = 9
@@ -55,8 +55,32 @@ N_GATE_FEATURES = 9
 # Data
 # ----------------------------------------------------------------------------
 
+ENWIK8_URL = "http://mattmahoney.net/dc/enwik8.zip"
+ENWIK8_PATH = "enwik8_10M.txt"
+
+
+def fetch_enwik8(path: str = ENWIK8_PATH, n_bytes: int = 10_000_000) -> None:
+    """First n_bytes of enwik8 (Wikipedia XML), decoded to text. The zip member is read in
+    memory, never extracted to disk, and sanity-checked before use."""
+    import io
+    import zipfile
+
+    print(f"Downloading enwik8 (36 MB) and keeping its first {n_bytes} bytes...")
+    with urllib.request.urlopen(ENWIK8_URL, timeout=120) as resp:
+        archive = zipfile.ZipFile(io.BytesIO(resp.read()))
+    raw = archive.read("enwik8")
+    if len(raw) != 100_000_000 or not raw.startswith(b"<mediawiki"):
+        raise RuntimeError("unexpected enwik8 contents; refusing to use the download")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(raw[:n_bytes].decode("utf-8", errors="ignore"))
+
+
 def load_text(path: str = DATA_PATH) -> str:
-    if not os.path.exists(path):
+    if path == "enwik8":
+        path = ENWIK8_PATH
+        if not os.path.exists(path):
+            fetch_enwik8(path)
+    elif not os.path.exists(path):
         print("Downloading raw Tiny Shakespeare text...")
         urllib.request.urlretrieve(DATA_URL, path)
     with open(path, "r", encoding="utf-8") as f:
@@ -68,8 +92,16 @@ def char_stream(text: str) -> tuple[np.ndarray, int, dict[int, str]]:
     char_to_int = {ch: i for i, ch in enumerate(chars)}
     decode_map = {i: ch for i, ch in enumerate(chars)}
     stream = np.array([char_to_int[c] for c in text], dtype=np.int32)
-    print(f"Loaded Tiny Shakespeare (chars): {len(stream)} tokens, {len(chars)} vocab size")
+    print(f"Loaded text (chars): {len(stream)} tokens, {len(chars)} vocab size")
     return stream, len(chars), decode_map
+
+
+def byte_stream(text: str) -> tuple[np.ndarray, int, dict[int, str]]:
+    """UTF-8 bytes as tokens (vocab 256): the usual choice for enwik8, one token = one byte."""
+    stream = np.frombuffer(text.encode("utf-8"), dtype=np.uint8).astype(np.int32)
+    decode_map = {i: chr(i) if 32 <= i < 127 else "." for i in range(256)}   # one char per byte keeps bits/char = bits/byte
+    print(f"Loaded text (bytes): {len(stream)} tokens, 256 vocab size")
+    return stream, 256, decode_map
 
 
 def bpe_stream(text: str, target_vocab: int) -> tuple[np.ndarray, int, dict[int, str]]:
@@ -109,8 +141,8 @@ class FastCache:
     def __init__(self, key_dim: int, vocab_size: int, max_size: int):
         self.vocab_size = vocab_size
         self.max_size = max_size
-        self.keys = torch.zeros(max_size, key_dim, device="cuda")  # stored already L2-normalized
-        self.next_tokens = torch.zeros(max_size, dtype=torch.long, device="cuda")
+        self.keys = torch.zeros(max_size, key_dim, device=DEVICE)  # stored already L2-normalized
+        self.next_tokens = torch.zeros(max_size, dtype=torch.long, device=DEVICE)
         self.size = 0
         self.ptr = 0
 
@@ -126,8 +158,8 @@ class FastCache:
         the scores are zero.
         """
         if self.size == 0:
-            uniform = torch.full((self.vocab_size,), 1.0 / self.vocab_size, device="cuda")
-            return uniform, torch.zeros((), dtype=torch.long, device="cuda"), torch.zeros(k, device="cuda")
+            uniform = torch.full((self.vocab_size,), 1.0 / self.vocab_size, device=DEVICE)
+            return uniform, torch.zeros((), dtype=torch.long, device=DEVICE), torch.zeros(k, device=DEVICE)
 
         q = F.normalize(query, p=2, dim=1).squeeze(0)
         scores = self.keys[: self.size] @ q
@@ -137,7 +169,7 @@ class FastCache:
         candidates = self.next_tokens[top]
         weights = (torch.exp((top_scores - top_scores[0]) / temp) if temp > 0
                    else torch.ones_like(top_scores))
-        votes = torch.zeros(self.vocab_size, device="cuda").index_add_(0, candidates, weights)
+        votes = torch.zeros(self.vocab_size, device=DEVICE).index_add_(0, candidates, weights)
         votes = votes / votes.sum()
         return votes, torch.argmax(votes), F.pad(top_scores, (0, want_k - k))  # always want_k scores
 
@@ -155,9 +187,10 @@ class FastCache:
 class StreamMetrics:
     """Running accuracies, character coverage, agreement breakdown and bits/char."""
 
-    def __init__(self, char_len: np.ndarray, net_label: str = "pcn"):
+    def __init__(self, char_len: np.ndarray, net_label: str = "pcn", mem_label: str = "cache"):
         self.char_len = char_len
         self.net_label = net_label
+        self.mem_label = mem_label
         self.tps: list[tuple[int, float]] = []      # (step, tokens/sec over the block ending there)
         self.n = 0
         self.chars = 0
@@ -200,7 +233,7 @@ class StreamMetrics:
         return self.bits[name] / max(self.chars, 1)
 
     def log_line(self, step: int, live_lam: float, tps: float) -> str:
-        return (f"Token {step} | {tps:.0f} tok/s | cache {self.rate('cache'):.2%} | "
+        return (f"Token {step} | {tps:.0f} tok/s | {self.mem_label} {self.rate('cache'):.2%} | "
                 f"{self.net_label} {self.rate('pcn'):.2%} | "
                 f"mix(lam={live_lam}) {self.rate(f'mix{live_lam}'):.2%} | "
                 f"adaptive {self.rate('adaptive'):.2%} | "
@@ -225,7 +258,7 @@ class StreamMetrics:
     def summary(self) -> str:
         lines = [f"\n[Result] {self.n} predictions over {self.chars} characters",
                  f"{'predictor':<18}{'token hit':>11}{'chars covered':>16}{'bits/char':>12}"]
-        rows = [("cache only", "cache", None), (f"{self.net_label} only", "pcn", "mix1.0")]
+        rows = [(f"{self.mem_label} only", "cache", None), (f"{self.net_label} only", "pcn", "mix1.0")]
         rows += [(f"mix lam={lam}", f"mix{lam}", f"mix{lam}" if lam > 0 else None) for lam in LAM_GRID]
         rows += [("route (no learn)", "route", "route"), ("adaptive gate", "adaptive", "adaptive")]
         for label, name, bits_key in rows:
@@ -236,8 +269,8 @@ class StreamMetrics:
         for name in ROUTERS:
             by_case = " | ".join(f"{k} {self.lam_sum_when[(name, k)] / max(v, 1):.3f}" for k, v in self.agree.items())
             lines.append(f"{name}: mean lam {self.lam_sum[name] / max(self.n, 1):.3f} | {by_case}")
-        lines.append(f"cache vs {self.net_label}: " + ", ".join(f"{k} {v / total:.2%}" for k, v in self.agree.items()))
-        lines.append(f"ceiling for any cache/{self.net_label} combination (either right): "
+        lines.append(f"{self.mem_label} vs {self.net_label}: " + ", ".join(f"{k} {v / total:.2%}" for k, v in self.agree.items()))
+        lines.append(f"ceiling for any {self.mem_label}/{self.net_label} combination (either right): "
                      f"{(total - self.agree['neither']) / total:.2%}")
         if self.tps:
             (_, first), (_, last) = self.tps[0], self.tps[-1]
@@ -251,6 +284,16 @@ class StreamMetrics:
 # ----------------------------------------------------------------------------
 
 class SphotaLM:
+    """Memory expert + online network, mixed by a learned gate.
+
+    memory="ngram": exact Witten-Bell n-gram (ngram_rows_bits=0) or its fixed-size hashed
+    version; the baseline floor the network has to beat. memory="cache": the earlier cosine
+    cache (FastCache), kept so older runs and sweep.py still reproduce.
+
+    The network reads the last `window` token embeddings (concatenated, newest first) plus
+    leaky traces of the same embeddings.
+    """
+
     def __init__(
         self,
         vocab_size: int,
@@ -271,11 +314,22 @@ class SphotaLM:
         pcn_epc: bool = False,
         pcn_inference_rate: float = 0.1,
         pcn_feedback_rate: float = 1e-4,
+        memory: str = "cache",
+        ngram_order: int = 5,
+        ngram_rows_bits: int = 0,
+        window: int = 1,
+        hidden_layers: int = 1,
+        lr_halflife: int = 0,
     ):
         torch.manual_seed(seed)
         if model_type not in ("pcn", "mlp"):
             raise ValueError(f"model_type must be 'pcn' or 'mlp', got {model_type!r}")
+        if memory not in ("cache", "ngram"):
+            raise ValueError(f"memory must be 'cache' or 'ngram', got {memory!r}")
+        if model_type == "pcn" and DEVICE != "cuda":
+            raise RuntimeError("model_type='pcn' needs a CUDA device")
         self.model_type = model_type
+        self.memory_kind = memory
         self.learn_embeddings = learn_embeddings
         self.lr = learning_rate
         self.embed_lr = embed_lr
@@ -290,36 +344,43 @@ class SphotaLM:
         self.gate_lr = gate_lr
         self.cache_temp = cache_temp
         self.cache_eps = cache_eps
+        self.ngram_order = ngram_order
+        self.ngram_rows_bits = ngram_rows_bits
+        self.window = window
+        self.hidden_layers = hidden_layers
+        self.latent_dim = latent_dim
+        self.lr_halflife = lr_halflife
+        self.mem = None                       # n-gram memory, built in stream_learn (it needs the stream)
 
         # Gate weights over the features in gate_features (last one is the bias).
         # Zero init -> lam = 0.5 until the gate has seen evidence.
-        self.gate_w = torch.zeros(N_GATE_FEATURES, device="cuda")
+        self.gate_w = torch.zeros(N_GATE_FEATURES, device=DEVICE)
 
         # Token codes the network reads. They are learned online when learn_embeddings is
-        # set; the cache always keys on a frozen copy of the initial codes so stored keys
-        # never go stale.
-        self.embedding = nn.Embedding(vocab_size, embed_dim).cuda()
+        # set; the cosine cache always keys on a frozen copy of the initial codes so stored
+        # keys never go stale.
+        self.embedding = nn.Embedding(vocab_size, embed_dim).to(DEVICE)
         self.cache_table = self.embedding.weight.detach().clone()
         self.embedding.weight.requires_grad_(learn_embeddings)
         if learn_embeddings:
             self.embed_opt = torch.optim.Adam([self.embedding.weight], lr=embed_lr)
         if learn_embeddings and model_type == "pcn":
             # The PCN returns no input gradient, so its embeddings get a DFA-style update:
-            # a fixed random projection of the output error onto the embedding space.
-            gen = torch.Generator(device="cuda").manual_seed(seed)
-            self.dfa_proj = torch.randn(vocab_size, embed_dim, device="cuda", generator=gen) / np.sqrt(vocab_size)
+            # a fixed random projection of the output error onto the whole input window.
+            gen = torch.Generator(device=DEVICE).manual_seed(seed)
+            self.dfa_proj = torch.randn(vocab_size, window * embed_dim, device=DEVICE, generator=gen) / np.sqrt(vocab_size)
 
-        ctx_dim = embed_dim * (1 + len(trace_decays))
-        net_in_dim = ctx_dim + (embed_dim if pcn_sees_cache else 0)
+        net_in_dim = embed_dim * (window + len(trace_decays)) + (embed_dim if pcn_sees_cache else 0)
 
         if model_type == "pcn":
-            self.pcn = pd.FullPCN(
-                Linear(net_in_dim, latent_dim),
-                ReLU(),
-                Linear(latent_dim, vocab_size),
-                batch_size=1,
-                device="cuda"
-            )
+            import pydeepity as pd
+            from pydeepity.layer import Linear, ReLU
+
+            layers = [Linear(net_in_dim, latent_dim), ReLU()]
+            for _ in range(hidden_layers - 1):
+                layers += [Linear(latent_dim, latent_dim), ReLU()]
+            layers.append(Linear(latent_dim, vocab_size))
+            self.pcn = pd.FullPCN(*layers, batch_size=1, device="cuda")
             self.pcn.configure(
                 learning_rate=learning_rate,
                 inference_rate=pcn_inference_rate,
@@ -331,54 +392,81 @@ class SphotaLM:
                 seed=seed,
             )
         else:
-            self.mlp = nn.Sequential(
-                nn.Linear(net_in_dim, latent_dim),
-                nn.ReLU(),
-                nn.Linear(latent_dim, vocab_size),
-            ).cuda()
+            layers = [nn.Linear(net_in_dim, latent_dim), nn.ReLU()]
+            for _ in range(hidden_layers - 1):
+                layers += [nn.Linear(latent_dim, latent_dim), nn.ReLU()]
+            layers.append(nn.Linear(latent_dim, vocab_size))
+            self.mlp = nn.Sequential(*layers).to(DEVICE)
             self.net_opt = torch.optim.Adam(self.mlp.parameters(), lr=learning_rate)
 
-        self.cache = FastCache(ctx_dim, vocab_size, max_size=cache_size)
+        if memory == "cache":
+            ctx_dim = embed_dim * (1 + len(trace_decays))
+            self.cache = FastCache(ctx_dim, vocab_size, max_size=cache_size)
+            self.mem_ent_norm = float(np.log(max(top_k, 2)))      # votes live on <= top_k tokens
+        else:
+            self.mem_ent_norm = float(np.log(vocab_size))
 
-    def gate_features(self, votes: torch.Tensor, p_pcn: torch.Tensor, top_scores: torch.Tensor,
-                      cache_pred: torch.Tensor) -> torch.Tensor:
+    def gate_features(self, mem_dist: torch.Tensor, p_net: torch.Tensor, mem_info: torch.Tensor,
+                      mem_pred: torch.Tensor) -> torch.Tensor:
         """Confidence and cross-check features for the gate, roughly in [0, 1].
 
-        votes is the raw (unsmoothed) cache vote distribution.
+        mem_dist is the memory expert's raw (unsmoothed) distribution. mem_info holds two
+        memory-specific confidence numbers: for the cosine cache the best match and its
+        drop-off to the k-th, for the n-gram the deepest context order used (as a fraction
+        of the maximum) and how often that context has been seen (log-scaled).
         """
         def entropy(p: torch.Tensor, norm: float) -> torch.Tensor:
             return -(p * torch.log(p.clamp_min(1e-12))).sum() / norm
 
         return torch.stack([
-            votes.max(),                                            # vote consensus
-            entropy(votes, np.log(max(self.top_k, 2))),             # votes live on <= top_k tokens
-            top_scores[0],                                          # best cosine match
-            10.0 * (top_scores[0] - top_scores[-1]),                # drop-off from 1st to k-th match
-            p_pcn.max(),
-            entropy(p_pcn, np.log(self.vocab_size)),
-            p_pcn[cache_pred],                                      # does the PCN back the cache's guess?
-            (torch.argmax(p_pcn) == cache_pred).float(),            # hard argmax agreement
-            torch.ones((), device="cuda"),
+            mem_dist.max(),                                         # consensus
+            entropy(mem_dist, self.mem_ent_norm),
+            mem_info[0],
+            mem_info[1],
+            p_net.max(),
+            entropy(p_net, np.log(self.vocab_size)),
+            p_net[mem_pred],                                        # does the network back the memory's guess?
+            (torch.argmax(p_net) == mem_pred).float(),              # hard argmax agreement
+            torch.ones((), device=DEVICE),
         ])
+
+    def _memory_vote(self, i: int, context: torch.Tensor | None):
+        """Returns (raw distribution, argmax, mem_info) for predicting stream[i]."""
+        if self.memory_kind == "cache":
+            votes, pred, top_scores = self.cache.vote(context, self.top_k, self.cache_temp)
+            return votes, pred, torch.stack([top_scores[0], 10.0 * (top_scores[0] - top_scores[-1])])
+        dist_np, _ = self.mem.vote(None, i)
+        dist = torch.from_numpy(dist_np.astype(np.float32)).to(DEVICE)
+        info = torch.tensor([self.mem.last_order / self.ngram_order,
+                             min(float(np.log1p(self.mem.last_total) / np.log1p(1000.0)), 1.0)], device=DEVICE)
+        return dist, torch.argmax(dist), info
 
     def stream_learn(self, stream: np.ndarray, decode_map: dict[int, str],
                      live_lam: float = 0.5, log_every: int = 10000,
                      verbose: bool = True) -> StreamMetrics:
+        if self.memory_kind == "ngram":
+            self.mem = (InterpNgram(self.ngram_order, self.vocab_size, stream) if self.ngram_rows_bits == 0
+                        else HashedInterpNgram(self.ngram_order, self.vocab_size, stream, self.ngram_rows_bits))
         if verbose:
-            print(f"[Info] Streaming {len(stream)} tokens | trace_decays={self.trace_decays} | "
-                  f"top_k={self.top_k} | pcn_sees_cache={self.pcn_sees_cache} | cache_size={self.cache.max_size} | "
-                  f"gate_lr={self.gate_lr} | cache_temp={self.cache_temp} | cache_eps={self.cache_eps}\n"
-                  f"       model={self.model_type} | learn_embeddings={self.learn_embeddings} | "
-                  f"lr={self.lr} | embed_lr={self.embed_lr} | "
-                  f"pcn_epc={self.pcn_epc} | pcn_inference_rate={self.pcn_inference_rate} | "
-                  f"pcn_feedback_rate={self.pcn_feedback_rate}")
+            mem_desc = (f"cache(top_k={self.top_k}, temp={self.cache_temp}, size={self.cache.max_size})"
+                        if self.memory_kind == "cache" else
+                        f"ngram(order={self.ngram_order}, rows_bits={self.ngram_rows_bits or 'exact'})")
+            print(f"[Info] Streaming {len(stream)} tokens | memory={mem_desc} | eps={self.cache_eps} | "
+                  f"gate_lr={self.gate_lr}\n"
+                  f"       model={self.model_type} | window={self.window} | traces={self.trace_decays} | "
+                  f"layers={self.hidden_layers}x{self.latent_dim} | learn_embeddings={self.learn_embeddings} | "
+                  f"lr={self.lr} | embed_lr={self.embed_lr} | lr_halflife={self.lr_halflife or 'off'} | "
+                  f"pcn_sees_cache={self.pcn_sees_cache}\n"
+                  f"       pcn_epc={self.pcn_epc} | pcn_inference_rate={self.pcn_inference_rate} | "
+                  f"pcn_feedback_rate={self.pcn_feedback_rate} | device={DEVICE}")
 
         char_len = np.array([len(decode_map[t]) for t in range(self.vocab_size)], dtype=np.int64)
-        metrics = StreamMetrics(char_len, net_label=self.model_type)
-        # Leaky traces of the frozen codes (cache keys) and, when embeddings are learned,
-        # of the learned codes as they were when each token went by (network input).
-        cache_traces = [torch.zeros(1, self.embed_dim, device="cuda") for _ in self.trace_decays]
-        net_traces = [torch.zeros(1, self.embed_dim, device="cuda") for _ in self.trace_decays]
+        mem_label = "cache" if self.memory_kind == "cache" else "ngram"
+        metrics = StreamMetrics(char_len, net_label=self.model_type, mem_label=mem_label)
+        # Leaky traces over the network's embeddings (as they were when each token went by),
+        # and, for the cosine cache, over the frozen codes.
+        net_traces = [torch.zeros(1, self.embed_dim, device=DEVICE) for _ in self.trace_decays]
+        cache_traces = [torch.zeros(1, self.embed_dim, device=DEVICE) for _ in self.trace_decays]
         one_hot = np.zeros((1, self.vocab_size), dtype=np.float32)
         block_start, block_step = time.perf_counter(), 0
 
@@ -386,24 +474,22 @@ class SphotaLM:
             prev_token = int(stream[i - 1])
             current_token = int(stream[i])
 
-            cache_prev = self.cache_table[prev_token].unsqueeze(0)
-            context = torch.cat([cache_prev, *cache_traces], dim=1)
+            # Memory expert
+            context = None
+            if self.memory_kind == "cache":
+                cache_prev = self.cache_table[prev_token].unsqueeze(0)
+                context = torch.cat([cache_prev, *cache_traces], dim=1)
+            mem_dist, mem_pred, mem_info = self._memory_vote(i, context)
+            p_cache = (1.0 - self.cache_eps) * mem_dist + self.cache_eps / self.vocab_size
 
-            # Cache vote
-            votes, cache_pred, top_scores = self.cache.vote(context, self.top_k, self.cache_temp)
-            p_cache = (1.0 - self.cache_eps) * votes + self.cache_eps / self.vocab_size
-
-            # Network logits. The learned embedding row is the only part of the input that
-            # carries a gradient; traces are constants.
-            if self.learn_embeddings:
-                net_prev = self.embedding.weight[prev_token].unsqueeze(0)
-                net_prev_val = net_prev.detach().clone()
-                net_input = torch.cat([net_prev, *net_traces], dim=1)
-            else:
-                net_prev_val = cache_prev
-                net_input = context
+            # Network input: the last `window` embeddings (newest first) plus traces. Only the
+            # window rows of a learned table carry a gradient; traces are constants.
+            win_idx = torch.tensor([int(stream[max(i - 1 - j, 0)]) for j in range(self.window)], device=DEVICE)
+            window_emb = self.embedding.weight[win_idx] if self.learn_embeddings else self.cache_table[win_idx]
+            net_prev_val = window_emb[0].detach().clone().unsqueeze(0)
+            net_input = torch.cat([window_emb.reshape(1, -1), *net_traces], dim=1)
             if self.pcn_sees_cache:
-                net_input = torch.cat([net_input, self.cache_table[cache_pred].unsqueeze(0)], dim=1)
+                net_input = torch.cat([net_input, self.cache_table[mem_pred].unsqueeze(0)], dim=1)
 
             if self.model_type == "mlp":
                 logits = self.mlp(net_input)
@@ -412,20 +498,20 @@ class SphotaLM:
                 # 0 settling steps = plain feed-forward readout
                 x_np = net_input.detach().cpu().numpy().astype(np.float32)
                 logits_np = self.pcn.predict(x_np, inference_steps=0).reshape(1, -1).astype(np.float32)
-                p_pcn = F.softmax(torch.from_numpy(logits_np).cuda(), dim=1).squeeze(0)
+                p_pcn = F.softmax(torch.from_numpy(logits_np).to(DEVICE), dim=1).squeeze(0)
 
-            # Routers: per-token lam from cache/PCN confidence
-            feats = self.gate_features(votes, p_pcn, top_scores, cache_pred)
+            # Routers: per-token lam from memory/network confidence
+            feats = self.gate_features(mem_dist, p_pcn, mem_info, mem_pred)
             lam_route = 1.0 - feats[0]
             lam_gate = torch.sigmoid(self.gate_w @ feats)
 
-            # Mixtures, gathered in one GPU->CPU transfer
+            # Mixtures, gathered in one device->CPU transfer
             lams = [*LAM_GRID, lam_route, lam_gate]
             mixes = [lam * p_pcn + (1.0 - lam) * p_cache for lam in lams]
             floor = 1e-4 / self.vocab_size
             probs = [(1 - 1e-4) * m[current_token] + floor for m in mixes]
             stacked = torch.stack(
-                [cache_pred.float(), torch.argmax(p_pcn).float()]
+                [mem_pred.float(), torch.argmax(p_pcn).float()]
                 + [torch.argmax(m).float() for m in mixes]
                 + [p for j, p in enumerate(probs) if not (j < len(LAM_GRID) and LAM_GRID[j] == 0)]
                 + [lam_route, lam_gate]
@@ -447,9 +533,12 @@ class SphotaLM:
             self.gate_w -= self.gate_lr * grad_z * feats
 
             # Learn
-            self.cache.imprint(context, current_token)
+            if self.memory_kind == "cache":
+                self.cache.imprint(context, current_token)
+            else:
+                self.mem.add(None, current_token, i)
             if self.model_type == "mlp":
-                target = torch.tensor([current_token], device="cuda")
+                target = torch.tensor([current_token], device=DEVICE)
                 self.net_opt.zero_grad()
                 if self.learn_embeddings:
                     self.embed_opt.zero_grad()
@@ -465,14 +554,26 @@ class SphotaLM:
                     err = p_pcn.clone()
                     err[current_token] -= 1.0                       # softmax - onehot
                     grad = torch.zeros_like(self.embedding.weight)
-                    grad[prev_token] = err @ self.dfa_proj
+                    grad.index_add_(0, win_idx, (err @ self.dfa_proj).reshape(self.window, self.embed_dim))
                     self.embedding.weight.grad = grad
                     self.embed_opt.step()
 
+            # Inverse-time learning-rate decay, lr_t = lr / (1 + t / halflife), refreshed every 1000 tokens
+            if self.lr_halflife and i % 1000 == 0:
+                scale = 1.0 / (1.0 + i / self.lr_halflife)
+                if self.model_type == "mlp":
+                    for group in self.net_opt.param_groups:
+                        group["lr"] = self.lr * scale
+                else:
+                    self.pcn.set_learning_rate(self.lr * scale)
+                if self.learn_embeddings:
+                    for group in self.embed_opt.param_groups:
+                        group["lr"] = self.embed_lr * scale
+
             # Roll the leaky integrators (they summarise tokens before prev_token)
-            cache_traces = [d * t + (1.0 - d) * cache_prev for d, t in zip(self.trace_decays, cache_traces)]
-            if self.learn_embeddings:
-                net_traces = [d * t + (1.0 - d) * net_prev_val for d, t in zip(self.trace_decays, net_traces)]
+            net_traces = [d * t + (1.0 - d) * net_prev_val for d, t in zip(self.trace_decays, net_traces)]
+            if self.memory_kind == "cache":
+                cache_traces = [d * t + (1.0 - d) * cache_prev for d, t in zip(self.trace_decays, cache_traces)]
 
             if log_every and i % log_every == 0:
                 now = time.perf_counter()
@@ -495,13 +596,22 @@ class SphotaLM:
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Sphota continuous-learning stream")
-    ap.add_argument("--tokenizer", choices=["char", "bpe"], default="char")
+    ap.add_argument("--data", default=DATA_PATH, help="text file, or 'enwik8' for the first 10M chars of enwik8")
+    ap.add_argument("--tokenizer", choices=["char", "byte", "bpe"], default="char")
     ap.add_argument("--bpe-vocab", type=int, default=512)
     ap.add_argument("--tokens", type=int, default=0, help="stream length (0 = whole corpus)")
     ap.add_argument("--start", type=int, default=0, help="first token of the stream segment")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--top-k", type=int, default=5)
-    ap.add_argument("--trace-decays", type=str, default="0.5,0.9")
+    ap.add_argument("--memory", choices=["ngram", "cache"], default="ngram",
+                    help="memory expert: Witten-Bell n-gram (the baseline floor) or the earlier cosine cache")
+    ap.add_argument("--ngram-order", type=int, default=5)
+    ap.add_argument("--ngram-rows-bits", type=int, default=0,
+                    help="0 = exact counts; otherwise log2 rows per order of the fixed-size hashed table")
+    ap.add_argument("--window", type=int, default=1, help="network context: last W token embeddings")
+    ap.add_argument("--hidden-layers", type=int, default=1)
+    ap.add_argument("--latent-dim", type=int, default=256)
+    ap.add_argument("--top-k", type=int, default=5, help="cosine cache only")
+    ap.add_argument("--trace-decays", type=str, default="0.5,0.9", help="comma list; empty for none")
     ap.add_argument("--model-type", choices=["pcn", "mlp"], default="pcn",
                     help="pcn = pydeepity FullPCN; mlp = same-shape PyTorch MLP trained online with Adam")
     ap.add_argument("--pcn-epc", action="store_true",
@@ -511,16 +621,18 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--pcn-feedback-rate", type=float, default=1e-4,
                     help="PCN direct-feedback (Psi) rate; 0 disables the direct-feedback term")
     ap.add_argument("--lr", type=float, default=3.3e-5, help="network learning rate")
+    ap.add_argument("--lr-halflife", type=int, default=0,
+                    help="inverse-time decay lr/(1+t/halflife) for the network and embeddings (0 = constant)")
     ap.add_argument("--embed-lr", type=float, default=3.3e-5, help="learning rate of the learned token embeddings")
     ap.add_argument("--freeze-embeddings", action="store_true",
                     help="keep the token codes fixed random (reproduces the earlier frozen runs; use --lr 1e-3)")
-    ap.add_argument("--cache-temp", type=float, default=0.05,
-                    help="similarity weighting of cache votes, exp(score/temp); 0 = plain counts")
-    ap.add_argument("--cache-eps", type=float, default=0.02, help="uniform smoothing mass on the cache distribution")
+    ap.add_argument("--cache-temp", type=float, default=0.02,
+                    help="cosine cache: vote weighting exp(score/temp); 0 = plain counts")
+    ap.add_argument("--cache-eps", type=float, default=0.02, help="uniform smoothing mass on the memory distribution")
     ap.add_argument("--gate-lr", type=float, default=0.05, help="SGD rate of the adaptive lam gate")
     ap.add_argument("--lam", type=float, default=0.5, choices=LAM_GRID, help="mixture weight shown live")
     ap.add_argument("--pcn-sees-cache", action="store_true",
-                    help="also feed the cache's guess into the PCN (default off, keeps the two independent)")
+                    help="also feed the memory's guess into the network (default off, keeps the two independent)")
     ap.add_argument("--log-every", type=int, default=10000)
     return ap.parse_args()
 
@@ -528,9 +640,11 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = parse_args()
 
-    text = load_text()
+    text = load_text(args.data)
     if args.tokenizer == "bpe":
         stream, vocab_size, decode_map = bpe_stream(text, args.bpe_vocab)
+    elif args.tokenizer == "byte":
+        stream, vocab_size, decode_map = byte_stream(text)
     else:
         stream, vocab_size, decode_map = char_stream(text)
 
@@ -538,7 +652,8 @@ if __name__ == "__main__":
 
     model = SphotaLM(
         vocab_size=vocab_size,
-        trace_decays=tuple(float(d) for d in args.trace_decays.split(",")),
+        latent_dim=args.latent_dim,
+        trace_decays=tuple(float(d) for d in args.trace_decays.split(",") if d.strip()),
         top_k=args.top_k,
         learning_rate=args.lr,
         pcn_sees_cache=args.pcn_sees_cache,
@@ -553,5 +668,11 @@ if __name__ == "__main__":
         pcn_epc=args.pcn_epc,
         pcn_inference_rate=args.pcn_inference_rate,
         pcn_feedback_rate=args.pcn_feedback_rate,
+        memory=args.memory,
+        ngram_order=args.ngram_order,
+        ngram_rows_bits=args.ngram_rows_bits,
+        window=args.window,
+        hidden_layers=args.hidden_layers,
+        lr_halflife=args.lr_halflife,
     )
     model.stream_learn(stream, decode_map, live_lam=args.lam, log_every=args.log_every)
