@@ -320,6 +320,7 @@ class SphotaLM:
         window: int = 1,
         hidden_layers: int = 1,
         lr_halflife: int = 0,
+        pcn_lmbda: float = 0.0,
     ):
         torch.manual_seed(seed)
         if model_type not in ("pcn", "mlp"):
@@ -336,6 +337,7 @@ class SphotaLM:
         self.pcn_epc = pcn_epc
         self.pcn_inference_rate = pcn_inference_rate
         self.pcn_feedback_rate = pcn_feedback_rate
+        self.pcn_lmbda = pcn_lmbda
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
         self.trace_decays = trace_decays
@@ -385,7 +387,7 @@ class SphotaLM:
                 learning_rate=learning_rate,
                 inference_rate=pcn_inference_rate,
                 feedback_rate=pcn_feedback_rate,
-                lmbda=0.0,
+                lmbda=pcn_lmbda,
                 optimizer="ADAMW",
                 use_epc=pcn_epc,
                 use_cross_entropy=True,
@@ -458,7 +460,7 @@ class SphotaLM:
                   f"lr={self.lr} | embed_lr={self.embed_lr} | lr_halflife={self.lr_halflife or 'off'} | "
                   f"pcn_sees_cache={self.pcn_sees_cache}\n"
                   f"       pcn_epc={self.pcn_epc} | pcn_inference_rate={self.pcn_inference_rate} | "
-                  f"pcn_feedback_rate={self.pcn_feedback_rate} | device={DEVICE}")
+                  f"pcn_feedback_rate={self.pcn_feedback_rate} | pcn_lmbda={self.pcn_lmbda} | device={DEVICE}")
 
         char_len = np.array([len(decode_map[t]) for t in range(self.vocab_size)], dtype=np.int64)
         mem_label = "cache" if self.memory_kind == "cache" else "ngram"
@@ -620,6 +622,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--pcn-inference-rate", type=float, default=0.1, help="PCN settling rate")
     ap.add_argument("--pcn-feedback-rate", type=float, default=1e-4,
                     help="PCN direct-feedback (Psi) rate; 0 disables the direct-feedback term")
+    ap.add_argument("--pcn-lmbda", type=float, default=0.0,
+                    help="PCN weight decay; with feedback on it also applies W*=(1-lmbda) every step to bound the "
+                         "direct-feedback drift (Deepity default 1e-2 is far too strong per token; try 1e-5)")
     ap.add_argument("--lr", type=float, default=3.3e-5, help="network learning rate")
     ap.add_argument("--lr-halflife", type=int, default=0,
                     help="inverse-time decay lr/(1+t/halflife) for the network and embeddings (0 = constant)")
@@ -674,5 +679,6 @@ if __name__ == "__main__":
         window=args.window,
         hidden_layers=args.hidden_layers,
         lr_halflife=args.lr_halflife,
+        pcn_lmbda=args.pcn_lmbda,
     )
     model.stream_learn(stream, decode_map, live_lam=args.lam, log_every=args.log_every)
