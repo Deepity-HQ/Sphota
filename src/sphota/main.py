@@ -5,7 +5,7 @@ Two predictors run side by side on one stream, and their probabilities are mixed
   * FastCache: nearest-neighbour memory keyed on the raw context
     (previous-token embedding + leaky traces). It votes over the next tokens
     of its top-k most similar past contexts -> a distribution over the vocab.
-  * Network (pydeepity FullPCN with a cross-entropy head, or --model-type mlp: a
+  * Network (deepity FullPCN with a cross-entropy head, or --model-type mlp: a
     plain PyTorch MLP of the same shape trained online with Adam): logits over the
     vocab from the same context, trained online one token at a time. Its token
     embeddings are learned online too (unless --freeze-embeddings). The cache keeps
@@ -379,8 +379,8 @@ class SphotaLM:
         net_in_dim = embed_dim * (window + len(trace_decays)) + (embed_dim if pcn_sees_cache else 0)
 
         if model_type == "pcn":
-            import pydeepity as pd
-            from pydeepity.layer import Linear, ReLU
+            import deepity as pd                    # the pip package `pydeepity` installs the module `deepity`
+            from deepity.layer import Linear, ReLU
 
             layers = [Linear(net_in_dim, latent_dim), ReLU()]
             for _ in range(hidden_layers - 1):
@@ -628,7 +628,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--top-k", type=int, default=5, help="cosine cache only")
     ap.add_argument("--trace-decays", type=str, default="0.5,0.9", help="comma list; empty for none")
     ap.add_argument("--model-type", choices=["pcn", "mlp"], default="pcn",
-                    help="pcn = pydeepity FullPCN; mlp = same-shape PyTorch MLP trained online with Adam")
+                    help="pcn = deepity FullPCN; mlp = same-shape PyTorch MLP trained online with Adam")
     ap.add_argument("--pcn-epc", action="store_true",
                     help="error-based PC: each settling step is a full forward+backward sweep (diagnostic; "
                          "not layer-local, so it is not the DKP O(1)-depth setting)")
