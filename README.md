@@ -7,14 +7,10 @@ A WIP Deepity Large Language Model, perceiving text via streams, and updating on
 These are recommended commands for development:
 
 ```bash
-# Build the Deepity library:
-cd /path/to/Deepity
-python build.py Release MKL --clean --native --DCMAKE_CUDA_ARCHITECTURES=80 -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++
-
-# Copy to pydeepity:
-cp build/Release/bin/pydeepity.cpython-312-x86_64-linux-gnu.so pydeepity/pydeepity.cpython-312-x86_64-linux-gnu.so
-# Copy pydeepity to Sphota:
-cp pydeepity /path/to/Sphota && cd /path/to/Sphota
+# Deepity comes from PyPI (a pre-release; the [cuda] extra bundles the CUDA runtime and cuBLAS).
+# It is a project dependency, so `uv run` installs it. To install or upgrade by hand:
+uv pip install --pre --upgrade "pydeepity[cuda]"
+# The module is imported as `deepity`.
 
 # Run Sphota, either by sbatch or manually:
 uv run python -m sphota.main
