@@ -6,7 +6,6 @@ __pycache__/
 /build/
 /dist/
 *.egg-info/
-/pydeepity/*.so
 
 # Local environments and tool caches
 .venv/
