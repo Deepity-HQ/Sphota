@@ -324,14 +324,17 @@ class SphotaLM:
         pcn_train_steps: int = 1,
         freeze_first_layer: bool = False,
         freeze_hidden: bool = False,
+        pcn_class: str = "full",
+        stack_memory: bool = False,
+        dkp_scale: float = 10.0,
     ):
         torch.manual_seed(seed)
         if model_type not in ("pcn", "mlp"):
             raise ValueError(f"model_type must be 'pcn' or 'mlp', got {model_type!r}")
         if memory not in ("cache", "ngram"):
             raise ValueError(f"memory must be 'cache' or 'ngram', got {memory!r}")
-        if model_type == "pcn" and DEVICE != "cuda":
-            raise RuntimeError("model_type='pcn' needs a CUDA device")
+        if pcn_class not in ("full", "dkp"):
+            raise ValueError(f"pcn_class must be 'full' or 'dkp', got {pcn_class!r}")
         self.model_type = model_type
         self.memory_kind = memory
         self.learn_embeddings = learn_embeddings
@@ -342,6 +345,11 @@ class SphotaLM:
         self.pcn_feedback_rate = pcn_feedback_rate
         self.pcn_lmbda = pcn_lmbda
         self.pcn_train_steps = pcn_train_steps
+        self.pcn_class = pcn_class
+        self.stack_memory = stack_memory
+        # DKPPCN has a squared-error head, so its raw outputs are scored as softmax(scale * out);
+        # the scale is one scalar learned online on the log-loss.
+        self.dkp_scale = dkp_scale
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
         self.trace_decays = trace_decays
@@ -377,6 +385,8 @@ class SphotaLM:
             self.dfa_proj = torch.randn(vocab_size, window * embed_dim, device=DEVICE, generator=gen) / np.sqrt(vocab_size)
 
         net_in_dim = embed_dim * (window + len(trace_decays)) + (embed_dim if pcn_sees_cache else 0)
+        if stack_memory:
+            net_in_dim += vocab_size + 2          # the memory's distribution plus its two confidence numbers
 
         if model_type == "pcn":
             import deepity as pd                    # the pip package `pydeepity` installs the module `deepity`
@@ -386,17 +396,29 @@ class SphotaLM:
             for _ in range(hidden_layers - 1):
                 layers += [Linear(latent_dim, latent_dim), ReLU()]
             layers.append(Linear(latent_dim, vocab_size))
-            self.pcn = pd.FullPCN(*layers, batch_size=1, device="cuda")
-            self.pcn.configure(
-                learning_rate=learning_rate,
-                inference_rate=pcn_inference_rate,
-                feedback_rate=pcn_feedback_rate,
-                lmbda=pcn_lmbda,
-                optimizer="ADAMW",
-                use_epc=pcn_epc,
-                use_cross_entropy=True,
-                seed=seed,
-            )
+            if pcn_class == "dkp":
+                # Direct Kolen-Pollack: learned feedback weights send the output error straight to
+                # every hidden layer, so one settling step already trains all of them.
+                self.pcn = pd.DKPPCN(*layers, batch_size=1, device=DEVICE)
+                self.pcn.configure(
+                    learning_rate=learning_rate,
+                    inference_rate=pcn_inference_rate,
+                    feedback_rate=pcn_feedback_rate,
+                    lmbda=pcn_lmbda,
+                    optimizer="ADAMW",
+                )
+            else:
+                self.pcn = pd.FullPCN(*layers, batch_size=1, device=DEVICE)
+                self.pcn.configure(
+                    learning_rate=learning_rate,
+                    inference_rate=pcn_inference_rate,
+                    feedback_rate=pcn_feedback_rate,
+                    lmbda=pcn_lmbda,
+                    optimizer="ADAMW",
+                    use_epc=pcn_epc,
+                    use_cross_entropy=True,
+                    seed=seed,
+                )
         else:
             layers = [nn.Linear(net_in_dim, latent_dim), nn.ReLU()]
             for _ in range(hidden_layers - 1):
@@ -473,7 +495,7 @@ class SphotaLM:
                   f"lr={self.lr} | embed_lr={self.embed_lr} | lr_halflife={self.lr_halflife or 'off'} | "
                   f"pcn_sees_cache={self.pcn_sees_cache}\n"
                   f"       pcn_epc={self.pcn_epc} | pcn_inference_rate={self.pcn_inference_rate} | "
-                  f"pcn_feedback_rate={self.pcn_feedback_rate} | pcn_lmbda={self.pcn_lmbda} | pcn_train_steps={self.pcn_train_steps} | device={DEVICE}")
+                  f"pcn_feedback_rate={self.pcn_feedback_rate} | pcn_lmbda={self.pcn_lmbda} | pcn_train_steps={self.pcn_train_steps} | pcn_class={self.pcn_class} | stack_memory={self.stack_memory} | device={DEVICE}")
 
         char_len = np.array([len(decode_map[t]) for t in range(self.vocab_size)], dtype=np.int64)
         mem_label = "cache" if self.memory_kind == "cache" else "ngram"
@@ -505,6 +527,8 @@ class SphotaLM:
             net_input = torch.cat([window_emb.reshape(1, -1), *net_traces], dim=1)
             if self.pcn_sees_cache:
                 net_input = torch.cat([net_input, self.cache_table[mem_pred].unsqueeze(0)], dim=1)
+            if self.stack_memory:
+                net_input = torch.cat([net_input, mem_dist.unsqueeze(0), mem_info.unsqueeze(0)], dim=1)
 
             if self.model_type == "mlp":
                 logits = self.mlp(net_input)
@@ -513,7 +537,11 @@ class SphotaLM:
                 # 0 settling steps = plain feed-forward readout
                 x_np = net_input.detach().cpu().numpy().astype(np.float32)
                 logits_np = self.pcn.predict(x_np, inference_steps=0).reshape(1, -1).astype(np.float32)
-                p_pcn = F.softmax(torch.from_numpy(logits_np).to(DEVICE), dim=1).squeeze(0)
+                out_t = torch.from_numpy(logits_np).to(DEVICE)
+                if self.pcn_class == "dkp":
+                    p_pcn = F.softmax(self.dkp_scale * out_t, dim=1).squeeze(0)
+                else:
+                    p_pcn = F.softmax(out_t, dim=1).squeeze(0)
 
             # Routers: per-token lam from memory/network confidence
             feats = self.gate_features(mem_dist, p_pcn, mem_info, mem_pred)
@@ -565,6 +593,10 @@ class SphotaLM:
                 one_hot[:] = 0.0
                 one_hot[0, current_token] = 1.0
                 self.pcn.train_step(x_np, one_hot, inference_steps=self.pcn_train_steps)
+                if self.pcn_class == "dkp":
+                    o = out_t.squeeze(0)                            # d(-log p_true)/d(scale) = -(o_true - E_p[o])
+                    grad_s = -(o[current_token] - (p_pcn * o).sum()).item()
+                    self.dkp_scale = float(np.clip(self.dkp_scale - 0.05 * grad_s, 1.0, 200.0))
                 if self.learn_embeddings:
                     err = p_pcn.clone()
                     err[current_token] -= 1.0                       # softmax - onehot
@@ -638,6 +670,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--pcn-lmbda", type=float, default=0.0,
                     help="PCN weight decay; with feedback on it also applies W*=(1-lmbda) every step to bound the "
                          "direct-feedback drift (Deepity default 1e-2 is far too strong per token; try 1e-5)")
+    ap.add_argument("--pcn-class", choices=["full", "dkp"], default="full",
+                    help="full = FullPCN (cross-entropy head, one-hop error messages); dkp = DKPPCN "
+                         "(direct Kolen-Pollack feedback, squared-error head)")
+    ap.add_argument("--stack-memory", action="store_true",
+                    help="feed the memory's distribution and confidence into the network so it learns corrections")
     ap.add_argument("--pcn-train-steps", type=int, default=1,
                     help="PCN settling steps per training token; errors travel one layer per step, so a network "
                          "with H hidden layers needs at least H for its first layer to see any error")
@@ -703,5 +740,7 @@ if __name__ == "__main__":
         pcn_train_steps=args.pcn_train_steps,
         freeze_first_layer=args.freeze_first_layer,
         freeze_hidden=args.freeze_hidden,
+        pcn_class=args.pcn_class,
+        stack_memory=args.stack_memory,
     )
     model.stream_learn(stream, decode_map, live_lam=args.lam, log_every=args.log_every)
