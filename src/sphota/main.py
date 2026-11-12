@@ -332,6 +332,10 @@ class SphotaLM:
         label_smooth: float = 0.0,
         mlp_loss: str = "ce",
         pcn_init_std: float = 0.0,
+        pcn_activation: str = "relu",
+        center_weights: bool = False,
+        pcn_optimizer: str = "ADAMW",
+        dkp_align_psi: bool = False,
     ):
         torch.manual_seed(seed)
         if model_type not in ("pcn", "mlp"):
@@ -358,6 +362,9 @@ class SphotaLM:
         self.psi_optimizer = psi_optimizer
         self.dkp_head = dkp_head
         self.label_smooth = label_smooth
+        self.pcn_activation = pcn_activation
+        self.center_weights = center_weights
+        self.pcn_init_std = pcn_init_std
         self.mlp_loss = mlp_loss              # "mse": sigmoid outputs fit to (smoothed) one-hot, like the DKP head
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
@@ -400,11 +407,12 @@ class SphotaLM:
 
         if model_type == "pcn":
             import deepity as pd                    # the pip package `pydeepity` installs the module `deepity`
-            from deepity.layer import Linear, ReLU, Sigmoid
+            from deepity.layer import GeLU, Linear, ReLU, Sigmoid
+            Act = GeLU if pcn_activation == "gelu" else ReLU
 
-            layers = [Linear(net_in_dim, latent_dim), ReLU()]
+            layers = [Linear(net_in_dim, latent_dim), Act()]
             for _ in range(hidden_layers - 1):
-                layers += [Linear(latent_dim, latent_dim), ReLU()]
+                layers += [Linear(latent_dim, latent_dim), Act()]
             layers.append(Linear(latent_dim, vocab_size))
             if pcn_class == "dkp" and dkp_head == "sigmoid":
                 layers.append(Sigmoid())
@@ -417,8 +425,9 @@ class SphotaLM:
                     inference_rate=pcn_inference_rate,
                     feedback_rate=pcn_feedback_rate,
                     lmbda=pcn_lmbda,
-                    optimizer="ADAMW",
+                    optimizer=pcn_optimizer,
                     psi_optimizer=psi_optimizer,
+                    center_weights=center_weights,
                 )
             else:
                 self.pcn = pd.FullPCN(*layers, batch_size=1, device=DEVICE)
@@ -427,8 +436,9 @@ class SphotaLM:
                     inference_rate=pcn_inference_rate,
                     feedback_rate=pcn_feedback_rate,
                     lmbda=pcn_lmbda,
-                    optimizer="ADAMW",
+                    optimizer=pcn_optimizer,
                     psi_optimizer=psi_optimizer,
+                    center_weights=center_weights,
                     use_epc=pcn_epc,
                     use_cross_entropy=True,
                     seed=seed,
@@ -437,6 +447,14 @@ class SphotaLM:
                 # Deepity's default init (sd ~0.08 here) lets settling pull each ReLU unit's mean
                 # incoming weight negative until the unit dies; a smaller init avoids that.
                 self.pcn.randomize_weights(seed, f"normal(0,{pcn_init_std})")
+            elif pcn_class == "dkp":
+                # DKPPCN.configure takes no seed; re-draw with each layer's own init so --seed applies.
+                self.pcn.randomize_weights(seed, "normal")
+            if pcn_class == "dkp" and dkp_align_psi:
+                # Start the output layer as the transpose of its feedback weights, so the error sent
+                # to the last hidden layer is the true gradient direction at token 0.
+                out = self._dkp_output_layer()
+                out.set_weights(np.ascontiguousarray(out.psi.T))
         else:
             layers = [nn.Linear(net_in_dim, latent_dim), nn.ReLU()]
             for _ in range(hidden_layers - 1):
@@ -496,6 +514,16 @@ class SphotaLM:
                              min(float(np.log1p(self.mem.last_total) / np.log1p(1000.0)), 1.0)], device=DEVICE)
         return dist, torch.argmax(dist), info
 
+    def _dkp_output_layer(self):
+        """The DKP layer that holds the readout weights (hidden -> vocab) and their feedback Psi."""
+        return [l for l in self.pcn.layers if l.weights.size][-1]
+
+    def psi_alignment(self) -> float:
+        """cos(Psi, W^T) on the output layer: +1 = the feedback is the exact gradient direction."""
+        out = self._dkp_output_layer()
+        a, b = out.psi, out.weights.T
+        return float((a * b).sum() / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-30))
+
     def stream_learn(self, stream: np.ndarray, decode_map: dict[int, str],
                      live_lam: float = 0.5, log_every: int = 10000,
                      verbose: bool = True) -> StreamMetrics:
@@ -513,7 +541,7 @@ class SphotaLM:
                   f"lr={self.lr} | embed_lr={self.embed_lr} | lr_halflife={self.lr_halflife or 'off'} | "
                   f"pcn_sees_cache={self.pcn_sees_cache}\n"
                   f"       pcn_epc={self.pcn_epc} | pcn_inference_rate={self.pcn_inference_rate} | "
-                  f"pcn_feedback_rate={self.pcn_feedback_rate} | pcn_lmbda={self.pcn_lmbda} | pcn_train_steps={self.pcn_train_steps} | pcn_class={self.pcn_class} | psi_opt={self.psi_optimizer} | head={self.dkp_head} | smooth={self.label_smooth} | stack_memory={self.stack_memory} | device={DEVICE}")
+                  f"pcn_feedback_rate={self.pcn_feedback_rate} | pcn_lmbda={self.pcn_lmbda} | pcn_train_steps={self.pcn_train_steps} | pcn_class={self.pcn_class} | psi_opt={self.psi_optimizer} | head={self.dkp_head} | smooth={self.label_smooth} | stack_memory={self.stack_memory} | act={self.pcn_activation} | center={self.center_weights} | init_std={self.pcn_init_std} | device={DEVICE}")
 
         char_len = np.array([len(decode_map[t]) for t in range(self.vocab_size)], dtype=np.int64)
         mem_label = "cache" if self.memory_kind == "cache" else "ngram"
@@ -667,6 +695,10 @@ class SphotaLM:
                     guess = decode_map.get(preds[f"mix{live_lam}"], "?")
                     actual = decode_map.get(current_token, "?")
                     print(f"{metrics.log_line(i, live_lam, tps)} | guess {guess!r} | actual {actual!r}")
+                    if self.model_type == "pcn" and self.pcn_class == "dkp":
+                        out = self._dkp_output_layer()
+                        print(f"  [psi] cos(Psi, W^T) {self.psi_alignment():+.3f} | "
+                              f"|Psi| {np.linalg.norm(out.psi):.2f} | |W| {np.linalg.norm(out.weights):.2f}")
 
         if verbose:
             print(metrics.summary())
@@ -721,6 +753,14 @@ def parse_args() -> argparse.Namespace:
                     help="smooth the one-hot targets of the PCN (0 = exact one-hot)")
     ap.add_argument("--pcn-init-std", type=float, default=0.0,
                     help="re-draw the PCN weights from normal(0, std); 0 keeps Deepity's default init")
+    ap.add_argument("--pcn-activation", choices=["relu", "gelu"], default="relu",
+                    help="hidden activation of the PCN")
+    ap.add_argument("--center-weights", action="store_true",
+                    help="PCN: re-center each layer's weight rows after every update (pydeepity >= 0.1.0a8)")
+    ap.add_argument("--pcn-optimizer", choices=["ADAMW", "SGD"], default="ADAMW",
+                    help="optimizer for the PCN's forward weights")
+    ap.add_argument("--dkp-align-psi", action="store_true",
+                    help="DKP: start the output weights as the transpose of their feedback weights")
     ap.add_argument("--mlp-loss", choices=["ce", "mse"], default="ce",
                     help="mlp control: mse = sigmoid outputs fit to one-hot targets (the DKP head's objective)")
     ap.add_argument("--stack-memory", action="store_true",
@@ -797,5 +837,9 @@ if __name__ == "__main__":
         label_smooth=args.label_smooth,
         mlp_loss=args.mlp_loss,
         pcn_init_std=args.pcn_init_std,
+        pcn_activation=args.pcn_activation,
+        center_weights=args.center_weights,
+        pcn_optimizer=args.pcn_optimizer,
+        dkp_align_psi=args.dkp_align_psi,
     )
     model.stream_learn(stream, decode_map, live_lam=args.lam, log_every=args.log_every)

@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=PCNinit
-#SBATCH --time=03:00:00
+#SBATCH --job-name=DKPseeds
+#SBATCH --time=04:00:00
 #SBATCH --mem=32G
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -8,7 +8,7 @@
 #SBATCH --partition=nextgen
 #SBATCH --gres=gpu:a100:1
 #SBATCH --account=PAS0350
-#SBATCH --output=/users/PAS0350/rubaolee2008/Jack_rose1775/Sphota/logs/PCNinit.log
+#SBATCH --output=/users/PAS0350/rubaolee2008/Jack_rose1775/Sphota/logs/DKPseeds.log
 
 module load cuda/13.2.1
 module load cudnn/9.21.1.3-13
@@ -24,29 +24,20 @@ run() {
   uv run python -m sphota.main $B "$@" > "$L/$name.log" 2>&1 &
 }
 
-# Small init (--pcn-init-std): Deepity's default init (sd ~0.08) lets settling pull each ReLU unit's
-# mean incoming weight negative until the unit dies. Locally at 30k tokens, sd 0.02 took DKP
-# (linear head) from 13% to 35% alone; the full PCN at 3 steps was 40% (default init).
-# Reference at 300k (full PCN, 2 layers, 3 steps, default init): 46.50% alone, 55.59% / 2.219 bits/char.
-D="--hidden-layers 2 --pcn-class dkp --psi-optimizer ADAMW --pcn-lmbda 1e-5 --pcn-init-std 0.02"
+# Does DKP's direct feedback help? One hidden layer, linear head, 1 settling step, no decay.
+# At 100k tokens locally (one seed), two settings beat feedback-off:
+#   SGD on W and Psi, random Psi:   36.24% vs 31.66% off  (cos(Psi, W^T) grew to +0.35)
+#   ADAMW on both, aligned Psi:     31.84% vs 27.66% off  (cos stays +1.000)
+# Here: 300k tokens, 3 seeds, each setting against feedback-off. Each log prints cos(Psi, W^T).
+D="--hidden-layers 1 --pcn-class dkp --pcn-train-steps 1 --pcn-lmbda 0"
+SGD="--pcn-optimizer SGD --psi-optimizer SGD --lr 1e-3"
+ADAM="--pcn-optimizer ADAMW --psi-optimizer ADAMW --lr 1e-4"
 
-# 1. DKP with small init: settling steps, and whether the direct feedback matters (fb0).
-run h_dkp_t1       $D --pcn-train-steps 1
-run h_dkp_t2       $D --pcn-train-steps 2
-run h_dkp_t3       $D --pcn-train-steps 3
-run h_dkp_t2_fb0   $D --pcn-train-steps 2 --pcn-feedback-rate 0
-run h_dkp_t1_fb0   $D --pcn-train-steps 1 --pcn-feedback-rate 0
-run h_dkp_t2_s03   $D --pcn-train-steps 2 --pcn-init-std 0.03
-
-# 2. Full PCN with small init: does it fix the 4-step divergence, and does it help at 3 steps?
-run h_full_t3      --hidden-layers 2 --pcn-train-steps 3 --pcn-init-std 0.02
-run h_full_t4      --hidden-layers 2 --pcn-train-steps 4 --pcn-init-std 0.02
-
-# 3. Stacking on the full PCN with small init (it hurt at the default init).
-run h_full_t3_stack --hidden-layers 2 --pcn-train-steps 3 --pcn-init-std 0.02 --stack-memory
-
-# 4. Backprop control on DKP's objective (squared error instead of cross-entropy), to split the
-#    gap to the cross-entropy MLP (49.07% alone at 300k) into objective cost and learning-rule cost.
-run h_mlp_mse      --hidden-layers 2 --model-type mlp --mlp-loss mse --label-smooth 0.1
+for s in 0 1 2; do
+  run k_sgd_on_s$s    $D $SGD  --seed $s --pcn-feedback-rate 1e-3
+  run k_sgd_off_s$s   $D $SGD  --seed $s --pcn-feedback-rate 0
+  run k_adam_al_s$s   $D $ADAM --seed $s --pcn-feedback-rate 1e-4 --dkp-align-psi
+  run k_adam_off_s$s  $D $ADAM --seed $s --pcn-feedback-rate 0
+done
 
 wait

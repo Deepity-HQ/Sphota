@@ -1338,18 +1338,18 @@ wheels = [
 
 [[package]]
 name = "pydeepity"
-version = "0.1.0a7"
+version = "0.1.0a8"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
     { name = "rich" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/eb/bc/f8905ab0b87a13b369a4b34fc84351cb0e0278bc80010f7f1fe39b81c4b6/pydeepity-0.1.0a7.tar.gz", hash = "sha256:d14f7f5dc745198e561c080fdea263cbf0ec2ac925edd2bda8509688432c4fc9", size = 13160371, upload-time = "2026-11-09T20:41:44.823Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/df/2f/c05566c466557b34d8c8d0b1bfdd44cd3d64b4362e3b3761ed76127dfb9e/pydeepity-0.1.0a8.tar.gz", hash = "sha256:9738604e94d3390dd760f6181836056d273fd0918caa8b0097fad54e7be403e2", size = 13168180, upload-time = "2026-11-12T16:21:46.84Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/00/42/9b5e51755e771cb52ba49a7ca86e804d1490021a2277a9fd3e7953bc1aca/pydeepity-0.1.0a7-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:53d8843e5c569dffd32acf2bca4cbe40294dbba3661e64a9c61ce9c303bf23a8", size = 28446960, upload-time = "2026-11-09T20:41:33.404Z" },
-    { url = "https://files.pythonhosted.org/packages/97/01/c264f555fcff64e84ef4b8145b913b97d7411059138e9ab2536823bf5d4c/pydeepity-0.1.0a7-cp312-cp312-win_amd64.whl", hash = "sha256:9a94e27fd4b3267964f80fa12172b95298d8a0ee62f0b776464eb72e3e479b6b", size = 34673698, upload-time = "2026-11-09T20:41:36.476Z" },
-    { url = "https://files.pythonhosted.org/packages/a2/dd/345c17793d5a5346d0077a27449c8e7d055dd211cfa3824ea884dc73ee7d/pydeepity-0.1.0a7-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:cc9e33c6a7694ea643f29fc3fd235448a74e47898f55fc34d778f4b926e8e624", size = 28446723, upload-time = "2026-11-09T20:41:39.267Z" },
-    { url = "https://files.pythonhosted.org/packages/1f/f2/1d481ccb8a9976c085b1c7f3b2967badc8fdab21ecb1057ad576a579079d/pydeepity-0.1.0a7-cp313-cp313-win_amd64.whl", hash = "sha256:4995ee7c393381bd759afabb4a74600a74809329421f0916f7c6653b40d5e5a0", size = 34673833, upload-time = "2026-11-09T20:41:41.901Z" },
+    { url = "https://files.pythonhosted.org/packages/26/e4/9d31e512643db1eb51946034289b68b8893e18dc7a4485ca7d5c1c581f52/pydeepity-0.1.0a8-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:b3c658d9ae3e635a2461b4449b91a3b066ff2fc836c364013282431eda5bccf7", size = 35202094, upload-time = "2026-11-12T16:21:33.909Z" },
+    { url = "https://files.pythonhosted.org/packages/47/00/f13be033bb6c7a08455d14d9fdf719e90e1d9b8249ae19eb8bd2b82980e9/pydeepity-0.1.0a8-cp312-cp312-win_amd64.whl", hash = "sha256:60a0e82f6a407e053266a63778b4fb564ceaf1758a3d99b99847f7dae00282d6", size = 34711949, upload-time = "2026-11-12T16:21:37.38Z" },
+    { url = "https://files.pythonhosted.org/packages/71/ca/5305f447d97d373e43720806b8fb8adf22f66bcd6f575a66a355921f20f3/pydeepity-0.1.0a8-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:80c6fe1e450f4e07493d56a78316a10a3717cde155be0e138420d02423033124", size = 35202307, upload-time = "2026-11-12T16:21:40.667Z" },
+    { url = "https://files.pythonhosted.org/packages/55/9f/2e96c53e97ccbfe4783ed2b15b8d1c6b4d577136b8db5577529cb79754ac/pydeepity-0.1.0a8-cp313-cp313-win_amd64.whl", hash = "sha256:086c1b45c50a387dd74a38d0e40fec1757f83779e64a4798db03c3df84d1e3a8", size = 34711940, upload-time = "2026-11-12T16:21:44.089Z" },
 ]
 
 [package.optional-dependencies]
@@ -1473,7 +1473,7 @@ dependencies = [
 requires-dist = [
     { name = "datasets", specifier = ">=5.1.0" },
     { name = "numpy", specifier = ">=2.5.4" },
-    { name = "pydeepity", extras = ["cuda"], specifier = ">=0.1.0a7" },
+    { name = "pydeepity", extras = ["cuda"], specifier = ">=0.1.0a8" },
     { name = "rich", specifier = ">=15.0.0" },
     { name = "tokenizers", specifier = ">=0.23.3" },
     { name = "torch", specifier = ">=2.14.1" },
