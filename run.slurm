@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=PCNdkp
+#SBATCH --job-name=PCNinit
 #SBATCH --time=03:00:00
 #SBATCH --mem=32G
 #SBATCH --nodes=1
@@ -8,7 +8,7 @@
 #SBATCH --partition=nextgen
 #SBATCH --gres=gpu:a100:1
 #SBATCH --account=PAS0350
-#SBATCH --output=/users/PAS0350/rubaolee2008/Jack_rose1775/Sphota/logs/PCNdkp.log
+#SBATCH --output=/users/PAS0350/rubaolee2008/Jack_rose1775/Sphota/logs/PCNinit.log
 
 module load cuda/13.2.1
 module load cudnn/9.21.1.3-13
@@ -24,21 +24,29 @@ run() {
   uv run python -m sphota.main $B "$@" > "$L/$name.log" 2>&1 &
 }
 
-# Reference from the last job (2 layers, 3 steps, no stacking): 46.50% alone, 55.59% / 2.219 bits/char.
+# Small init (--pcn-init-std): Deepity's default init (sd ~0.08) lets settling pull each ReLU unit's
+# mean incoming weight negative until the unit dies. Locally at 30k tokens, sd 0.02 took DKP
+# (linear head) from 13% to 35% alone; the full PCN at 3 steps was 40% (default init).
+# Reference at 300k (full PCN, 2 layers, 3 steps, default init): 46.50% alone, 55.59% / 2.219 bits/char.
+D="--hidden-layers 2 --pcn-class dkp --psi-optimizer ADAMW --pcn-lmbda 1e-5 --pcn-init-std 0.02"
 
-# 1. Stacking: the network also reads the n-gram's distribution, so it learns corrections to it.
-run g_stack_t3     --hidden-layers 2 --pcn-train-steps 3 --stack-memory
-run g_stack_t3_fl0 --hidden-layers 2 --pcn-train-steps 3 --stack-memory --pcn-feedback-rate 0
+# 1. DKP with small init: settling steps, and whether the direct feedback matters (fb0).
+run h_dkp_t1       $D --pcn-train-steps 1
+run h_dkp_t2       $D --pcn-train-steps 2
+run h_dkp_t3       $D --pcn-train-steps 3
+run h_dkp_t2_fb0   $D --pcn-train-steps 2 --pcn-feedback-rate 0
+run h_dkp_t1_fb0   $D --pcn-train-steps 1 --pcn-feedback-rate 0
+run h_dkp_t2_s03   $D --pcn-train-steps 2 --pcn-init-std 0.03
 
-# 2. Settling steps: does 2 layers keep improving past 3 steps, and what do 1 layer need?
-run g_L2_t4        --hidden-layers 2 --pcn-train-steps 4
-run g_L1_t3        --hidden-layers 1 --pcn-train-steps 3
-run g_L1_t4        --hidden-layers 1 --pcn-train-steps 4
+# 2. Full PCN with small init: does it fix the 4-step divergence, and does it help at 3 steps?
+run h_full_t3      --hidden-layers 2 --pcn-train-steps 3 --pcn-init-std 0.02
+run h_full_t4      --hidden-layers 2 --pcn-train-steps 4 --pcn-init-std 0.02
 
-# 3. Direct Kolen-Pollack (one-step error to every layer, squared-error head). Local CPU tests
-#    were weak (<16% at 30k tokens) and diverged at feedback 1e-3, so keep the rates small.
-run g_dkp_t1       --hidden-layers 2 --pcn-class dkp --pcn-train-steps 1 --pcn-lmbda 1e-5
-run g_dkp_t2       --hidden-layers 2 --pcn-class dkp --pcn-train-steps 2 --pcn-lmbda 1e-5
-run g_dkp_t2_fb    --hidden-layers 2 --pcn-class dkp --pcn-train-steps 2 --pcn-lmbda 1e-5 --pcn-feedback-rate 1e-5
+# 3. Stacking on the full PCN with small init (it hurt at the default init).
+run h_full_t3_stack --hidden-layers 2 --pcn-train-steps 3 --pcn-init-std 0.02 --stack-memory
+
+# 4. Backprop control on DKP's objective (squared error instead of cross-entropy), to split the
+#    gap to the cross-entropy MLP (49.07% alone at 300k) into objective cost and learning-rule cost.
+run h_mlp_mse      --hidden-layers 2 --model-type mlp --mlp-loss mse --label-smooth 0.1
 
 wait

@@ -327,6 +327,11 @@ class SphotaLM:
         pcn_class: str = "full",
         stack_memory: bool = False,
         dkp_scale: float = 10.0,
+        psi_optimizer: str = "SGD",
+        dkp_head: str = "linear",
+        label_smooth: float = 0.0,
+        mlp_loss: str = "ce",
+        pcn_init_std: float = 0.0,
     ):
         torch.manual_seed(seed)
         if model_type not in ("pcn", "mlp"):
@@ -350,6 +355,10 @@ class SphotaLM:
         # DKPPCN has a squared-error head, so its raw outputs are scored as softmax(scale * out);
         # the scale is one scalar learned online on the log-loss.
         self.dkp_scale = dkp_scale
+        self.psi_optimizer = psi_optimizer
+        self.dkp_head = dkp_head
+        self.label_smooth = label_smooth
+        self.mlp_loss = mlp_loss              # "mse": sigmoid outputs fit to (smoothed) one-hot, like the DKP head
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
         self.trace_decays = trace_decays
@@ -364,6 +373,7 @@ class SphotaLM:
         self.hidden_layers = hidden_layers
         self.latent_dim = latent_dim
         self.lr_halflife = lr_halflife
+        self.nonfinite_tokens = 0             # tokens on which the network's output was NaN/inf
         self.mem = None                       # n-gram memory, built in stream_learn (it needs the stream)
 
         # Gate weights over the features in gate_features (last one is the bias).
@@ -390,12 +400,14 @@ class SphotaLM:
 
         if model_type == "pcn":
             import deepity as pd                    # the pip package `pydeepity` installs the module `deepity`
-            from deepity.layer import Linear, ReLU
+            from deepity.layer import Linear, ReLU, Sigmoid
 
             layers = [Linear(net_in_dim, latent_dim), ReLU()]
             for _ in range(hidden_layers - 1):
                 layers += [Linear(latent_dim, latent_dim), ReLU()]
             layers.append(Linear(latent_dim, vocab_size))
+            if pcn_class == "dkp" and dkp_head == "sigmoid":
+                layers.append(Sigmoid())
             if pcn_class == "dkp":
                 # Direct Kolen-Pollack: learned feedback weights send the output error straight to
                 # every hidden layer, so one settling step already trains all of them.
@@ -406,6 +418,7 @@ class SphotaLM:
                     feedback_rate=pcn_feedback_rate,
                     lmbda=pcn_lmbda,
                     optimizer="ADAMW",
+                    psi_optimizer=psi_optimizer,
                 )
             else:
                 self.pcn = pd.FullPCN(*layers, batch_size=1, device=DEVICE)
@@ -415,10 +428,15 @@ class SphotaLM:
                     feedback_rate=pcn_feedback_rate,
                     lmbda=pcn_lmbda,
                     optimizer="ADAMW",
+                    psi_optimizer=psi_optimizer,
                     use_epc=pcn_epc,
                     use_cross_entropy=True,
                     seed=seed,
                 )
+            if pcn_init_std > 0:
+                # Deepity's default init (sd ~0.08 here) lets settling pull each ReLU unit's mean
+                # incoming weight negative until the unit dies; a smaller init avoids that.
+                self.pcn.randomize_weights(seed, f"normal(0,{pcn_init_std})")
         else:
             layers = [nn.Linear(net_in_dim, latent_dim), nn.ReLU()]
             for _ in range(hidden_layers - 1):
@@ -495,7 +513,7 @@ class SphotaLM:
                   f"lr={self.lr} | embed_lr={self.embed_lr} | lr_halflife={self.lr_halflife or 'off'} | "
                   f"pcn_sees_cache={self.pcn_sees_cache}\n"
                   f"       pcn_epc={self.pcn_epc} | pcn_inference_rate={self.pcn_inference_rate} | "
-                  f"pcn_feedback_rate={self.pcn_feedback_rate} | pcn_lmbda={self.pcn_lmbda} | pcn_train_steps={self.pcn_train_steps} | pcn_class={self.pcn_class} | stack_memory={self.stack_memory} | device={DEVICE}")
+                  f"pcn_feedback_rate={self.pcn_feedback_rate} | pcn_lmbda={self.pcn_lmbda} | pcn_train_steps={self.pcn_train_steps} | pcn_class={self.pcn_class} | psi_opt={self.psi_optimizer} | head={self.dkp_head} | smooth={self.label_smooth} | stack_memory={self.stack_memory} | device={DEVICE}")
 
         char_len = np.array([len(decode_map[t]) for t in range(self.vocab_size)], dtype=np.int64)
         mem_label = "cache" if self.memory_kind == "cache" else "ngram"
@@ -532,7 +550,11 @@ class SphotaLM:
 
             if self.model_type == "mlp":
                 logits = self.mlp(net_input)
-                p_pcn = F.softmax(logits.detach(), dim=1).squeeze(0)
+                if self.mlp_loss == "mse":
+                    out_t = torch.sigmoid(logits).detach()
+                    p_pcn = F.softmax(self.dkp_scale * out_t, dim=1).squeeze(0)
+                else:
+                    p_pcn = F.softmax(logits.detach(), dim=1).squeeze(0)
             else:
                 # 0 settling steps = plain feed-forward readout
                 x_np = net_input.detach().cpu().numpy().astype(np.float32)
@@ -542,6 +564,12 @@ class SphotaLM:
                     p_pcn = F.softmax(self.dkp_scale * out_t, dim=1).squeeze(0)
                 else:
                     p_pcn = F.softmax(out_t, dim=1).squeeze(0)
+
+            # A diverged network (NaN/inf outputs) must not poison the mixture or the gate: fall back
+            # to a uniform guess for this token and count it.
+            if not bool(torch.isfinite(p_pcn).all()):
+                p_pcn = torch.full_like(p_pcn, 1.0 / self.vocab_size)
+                self.nonfinite_tokens += 1
 
             # Routers: per-token lam from memory/network confidence
             feats = self.gate_features(mem_dist, p_pcn, mem_info, mem_pred)
@@ -585,13 +613,21 @@ class SphotaLM:
                 self.net_opt.zero_grad()
                 if self.learn_embeddings:
                     self.embed_opt.zero_grad()
-                F.cross_entropy(logits, target).backward()
+                if self.mlp_loss == "mse":
+                    tgt = torch.full((1, self.vocab_size), self.label_smooth / self.vocab_size, device=DEVICE)
+                    tgt[0, current_token] = 1.0 - self.label_smooth + self.label_smooth / self.vocab_size
+                    (0.5 * (torch.sigmoid(logits) - tgt).pow(2).sum()).backward()
+                    o = out_t.squeeze(0)
+                    grad_s = -(o[current_token] - (p_pcn * o).sum()).item()
+                    self.dkp_scale = float(np.clip(self.dkp_scale - 0.05 * grad_s, 1.0, 200.0))
+                else:
+                    F.cross_entropy(logits, target).backward()
                 self.net_opt.step()
                 if self.learn_embeddings:
                     self.embed_opt.step()
             else:
-                one_hot[:] = 0.0
-                one_hot[0, current_token] = 1.0
+                one_hot[:] = self.label_smooth / self.vocab_size
+                one_hot[0, current_token] = 1.0 - self.label_smooth + self.label_smooth / self.vocab_size
                 self.pcn.train_step(x_np, one_hot, inference_steps=self.pcn_train_steps)
                 if self.pcn_class == "dkp":
                     o = out_t.squeeze(0)                            # d(-log p_true)/d(scale) = -(o_true - E_p[o])
@@ -634,6 +670,9 @@ class SphotaLM:
 
         if verbose:
             print(metrics.summary())
+            if self.nonfinite_tokens:
+                print(f"[Warn] the network's output was non-finite on {self.nonfinite_tokens} tokens "
+                      f"(replaced by a uniform guess); it has probably diverged")
         return metrics
 
 
@@ -673,6 +712,17 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--pcn-class", choices=["full", "dkp"], default="full",
                     help="full = FullPCN (cross-entropy head, one-hop error messages); dkp = DKPPCN "
                          "(direct Kolen-Pollack feedback, squared-error head)")
+    ap.add_argument("--psi-optimizer", default="SGD", choices=["SGD", "ADAMW"],
+                    help="optimizer of the direct-feedback weights Psi; with SGD at small rates Psi barely moves "
+                         "(plain feedback alignment), ADAMW makes it Kolen-Pollack-like")
+    ap.add_argument("--dkp-head", choices=["linear", "sigmoid"], default="linear",
+                    help="dkp only: squared-error output layer, bare linear or followed by a sigmoid")
+    ap.add_argument("--label-smooth", type=float, default=0.0,
+                    help="smooth the one-hot targets of the PCN (0 = exact one-hot)")
+    ap.add_argument("--pcn-init-std", type=float, default=0.0,
+                    help="re-draw the PCN weights from normal(0, std); 0 keeps Deepity's default init")
+    ap.add_argument("--mlp-loss", choices=["ce", "mse"], default="ce",
+                    help="mlp control: mse = sigmoid outputs fit to one-hot targets (the DKP head's objective)")
     ap.add_argument("--stack-memory", action="store_true",
                     help="feed the memory's distribution and confidence into the network so it learns corrections")
     ap.add_argument("--pcn-train-steps", type=int, default=1,
@@ -742,5 +792,10 @@ if __name__ == "__main__":
         freeze_hidden=args.freeze_hidden,
         pcn_class=args.pcn_class,
         stack_memory=args.stack_memory,
+        psi_optimizer=args.psi_optimizer,
+        dkp_head=args.dkp_head,
+        label_smooth=args.label_smooth,
+        mlp_loss=args.mlp_loss,
+        pcn_init_std=args.pcn_init_std,
     )
     model.stream_learn(stream, decode_map, live_lam=args.lam, log_every=args.log_every)
